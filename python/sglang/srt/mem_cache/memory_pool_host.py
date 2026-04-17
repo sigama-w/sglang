@@ -999,7 +999,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
- def _npu_load_mla_layer(self, device_pool, host_indices, device_indices, layer_id):
+    def _npu_load_mla_layer(self, device_pool, host_indices, device_indices, layer_id):
         """NPU torch fallback: load KV from host to device (separate k/v buffers)."""
         device = device_pool.k_buffer[layer_id].device
         host_device = self.kv_buffer[layer_id].device

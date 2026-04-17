@@ -501,8 +501,10 @@ class ModelRunnerKVCacheMixin:
                 )
             elif self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUHiSparseTokenToKVPool,
                     NPUMLATokenToKVPool,
                 )
+
                 pool_kwargs = dict(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
