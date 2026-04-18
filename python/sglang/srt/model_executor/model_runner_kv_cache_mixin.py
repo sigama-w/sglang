@@ -510,6 +510,13 @@ class ModelRunnerKVCacheMixin:
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    index_head_dim=(
+                        self.model_config.index_head_dim if is_nsa_model else None
+                    ),
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
@@ -729,6 +736,22 @@ class ModelRunnerKVCacheMixin:
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
+                    )
+                elif self.enable_hisparse and is_nsa_model:
+                    from sglang.srt.mem_cache.hisparse_memory_pool import (
+                        HiSparseTokenToKVPoolAllocator,
+                    )
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    hisparse_cfg = parse_hisparse_config(self.server_args)
+                    self.token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                        host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                     )
                 else:
                     from sglang.srt.hardware_backend.npu.allocator_npu import (
