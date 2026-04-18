@@ -50,7 +50,7 @@ def _chunk_cumsum_fwd_kernel(
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
-    BLOCK_SIZE_H: tl.constexpr = 16,
+    BLOCK_SIZE_H: tl.constexpr = 2,
 ):
     pid_b = tl.program_id(axis=0)
 
@@ -450,7 +450,7 @@ def _chunk_cumsum_fwd(
         assert dt_bias.shape == (nheads,)
     nchunks = math.ceil(seqlen / chunk_size)
     dt_out = torch.empty(
-        batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
+        batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.bfloat16
     )
     dA_cumsum = torch.empty(
         batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
@@ -565,8 +565,89 @@ def _chunk_state_fwd(
     return states
 
 
+# def chunk_state_varlen(
+#     B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+# ):
+#     total_seqlen, nheads, headdim = x.shape
+#     _, nchunks, chunk_size = dt.shape
+#     _, ngroups, dstate = B.shape
+#     batch = cu_seqlens.shape[0] - 1
+#     cu_seqlens = cu_seqlens.contiguous()
+#     assert nheads % ngroups == 0
+#     assert B.shape == (total_seqlen, ngroups, dstate)
+#     assert dt.shape == (nheads, nchunks, chunk_size)
+#     assert dA_cumsum.shape == dt.shape
+#     assert chunk_states.shape == (nchunks, nheads, headdim, dstate)
+
+#     if initial_states is not None:
+#         assert initial_states.shape == (batch, nheads, headdim, dstate)
+
+#     states = torch.empty(
+#         batch,
+#         nheads,
+#         headdim,
+#         dstate,
+#         dtype=chunk_states.dtype,
+#         device=chunk_states.device,
+#     )
+#     grid = lambda META: (
+#         triton.cdiv(headdim, META["BLOCK_SIZE_M"])
+#         * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
+#         batch,
+#         nheads,
+#     )
+#     with torch.cuda.device(x.device.index):
+#         _chunk_state_varlen_kernel[grid](
+#             x,
+#             B,
+#             dt,
+#             dA_cumsum,
+#             chunk_states,
+#             cu_seqlens,
+#             states,
+#             initial_states,
+#             headdim,
+#             dstate,
+#             chunk_size,
+#             total_seqlen,
+#             nheads // ngroups,
+#             x.stride(0),
+#             x.stride(1),
+#             x.stride(2),
+#             B.stride(0),
+#             B.stride(1),
+#             B.stride(2),
+#             dt.stride(1),
+#             dt.stride(0),
+#             dt.stride(2),
+#             dA_cumsum.stride(1),
+#             dA_cumsum.stride(0),
+#             dA_cumsum.stride(2),
+#             chunk_states.stride(0),
+#             chunk_states.stride(1),
+#             chunk_states.stride(2),
+#             chunk_states.stride(3),
+#             states.stride(0),
+#             states.stride(1),
+#             states.stride(2),
+#             states.stride(3),
+#             *(
+#                 (
+#                     initial_states.stride(0),
+#                     initial_states.stride(1),
+#                     initial_states.stride(2),
+#                     initial_states.stride(3),
+#                 )
+#                 if initial_states is not None
+#                 else (0, 0, 0, 0)
+#             ),
+#             HAS_INITSTATES=initial_states is not None,
+#         )
+#     return states
+
+
 def chunk_state_varlen(
-    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None, debug=False
 ):
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -590,57 +671,115 @@ def chunk_state_varlen(
         dtype=chunk_states.dtype,
         device=chunk_states.device,
     )
-    grid = lambda META: (
-        triton.cdiv(headdim, META["BLOCK_SIZE_M"])
-        * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
-        batch,
-        nheads,
-    )
-    with torch.cuda.device(x.device.index):
-        _chunk_state_varlen_kernel[grid](
-            x,
-            B,
-            dt,
-            dA_cumsum,
-            chunk_states,
-            cu_seqlens,
-            states,
-            initial_states,
-            headdim,
-            dstate,
-            chunk_size,
-            total_seqlen,
-            nheads // ngroups,
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            dt.stride(1),
-            dt.stride(0),
-            dt.stride(2),
-            dA_cumsum.stride(1),
-            dA_cumsum.stride(0),
-            dA_cumsum.stride(2),
-            chunk_states.stride(0),
-            chunk_states.stride(1),
-            chunk_states.stride(2),
-            chunk_states.stride(3),
-            states.stride(0),
-            states.stride(1),
-            states.stride(2),
-            states.stride(3),
-            *(
-                (
-                    initial_states.stride(0),
-                    initial_states.stride(1),
-                    initial_states.stride(2),
-                    initial_states.stride(3),
-                )
-                if initial_states is not None
-                else (0, 0, 0, 0)
-            ),
-            HAS_INITSTATES=initial_states is not None,
-        )
+    states.zero_()
+
+    nheads_ngroup = nheads // ngroups
+    HAS_INITSTATES = initial_states is not None
+    Block_SIZE_K = 16
+    dtype = chunk_states.dtype
+    device = chunk_states.device
+
+    x = x.contiguous()
+    B = B.contiguous()
+    dt = dt.contiguous()
+    dA_cumsum = dA_cumsum.contiguous()
+    chunk_states = chunk_states.contiguous()
+    if HAS_INITSTATES:
+        initial_states = initial_states.contiguous()
+
+    #遍历每个batch
+    for pid_b in range(batch):
+        start_idx = cu_seqlens[pid_b].item()
+        end_idx = cu_seqlens[pid_b + 1].item()
+        curr_seqlen = end_idx - start_idx
+        if curr_seqlen == 0:
+            continue
+
+        #计算当前chunk id
+        pid_c = (end_idx - 1) // chunk_size
+        pid_c = min(pid_c, nchunks - 1)
+        chunk_start = pid_c * chunk_size
+        chunk_end = min((pid_c + 1) * chunk_size, total_seqlen)
+
+        #提前计算chunk内有效长度
+        chunk_size_limit = max(0, end_idx - chunk_start)
+        if chunk_size_limit <= 0:
+            continue
+        #确保不超过chunk本身长度
+        chunk_size_limit = min(chunk_size_limit, chunk_size)
+
+        #遍历每个head
+        for pid_h in range(nheads):
+            #仅调试第一个batch+第一个head
+            if debug and (pid_b != 0 and pid_h != 0):
+                continue
+
+            group_id = pid_h // nheads_ngroup
+
+            dt_chunk = dt[pid_h, pid_c, :chunk_size_limit].to(dtype)
+            dA_cs_chunk = dA_cumsum[pid_h, pid_c, :chunk_size_limit].to(dtype)
+            x_chunk = x[chunk_start:chunk_start+chunk_size_limit, pid_h, :].to(dtype)
+            b_chunk = B[chunk_start:chunk_start+chunk_size_limit, group_id, :].to(dtype)
+
+            if debug:
+                print(f"[B{pid_b}H{pid_h}C{pid_c}] chunk_limit: {chunk_size_limit} | dt_mean: {dt_chunk.mean().item():.8f} | dA_cs_mean: {dA_cs_chunk.mean().item():.8f} | x_chunk_mean: {x_chunk.mean().item():.8f} | b_chunk_mean: {b_chunk.mean().item():.8f}")
+
+            #初始累加器
+            acc = torch.zeros((headdim, dstate), dtype=dtype, device=device)
+
+            #遍历chunk内元素
+            for k in range(0, chunk_size_limit, Block_SIZE_K):
+                k_end = min(k + Block_SIZE_K, chunk_size_limit)
+                x_block = x_chunk[k:k_end, :]
+                b_block = b_chunk[k:k_end, :]
+                dt_block = dt_chunk[k:k_end]
+                dA_cs_k_block = dA_cs_chunk[k:k_end]
+                
+                dA_cs_last = dA_cs_chunk[-1] if chunk_size_limit > 0 else torch.tensor(0.0, dtype=dtype, device=device)
+
+                block_rel_pos = torch.arange(k_end - k, device=device)
+                chunk_block_start = k
+                start_idx_cur = max(start_idx - chunk_start, 0)
+                mask = block_rel_pos >= (start_idx_cur - chunk_block_start)
+                scale = torch.exp(dA_cs_last - dA_cs_k_block) * dt_block
+                scale = torch.where(mask, scale, torch.tensor(0.0, dtype=dtype, device=device))
+
+                matmul_res = torch.matmul(x_block.T, b_block * scale.unsqueeze(-1))
+                acc += matmul_res
+
+                if debug:
+                    print(f"k{k}-{k_end} | scale_mean: {scale.mean().item():.8f} | matmul_res_mean: {matmul_res.mean().item():.8f} | acc_mean: {acc.mean().item():.8f}")
+
+            #处理初始状态/历史状态
+            if(start_idx < chunk_start) or HAS_INITSTATES:
+                dA_cs_boundary = torch.tensor(0.0, dtype=dtype, device=device)
+
+                if not HAS_INITSTATES:
+                    past_states = chunk_states[pid_c, pid_h, :, :].to(dtype)
+                else:
+                    if start_idx < chunk_start:
+                        past_states = initial_states[pid_c, pid_h, :, :].to(dtype)
+                    else:
+                        past_states = initial_states[pid_b, pid_h, :, :].to(dtype)
+                        if start_idx > chunk_start:
+                            boundary_idx = start_idx - chunk_start - 1
+                            if 0 <= boundary_idx < chunk_size_limit:
+                                dA_cs_boundary = dA_cs_chunk[boundary_idx]
+                
+                scale_state = torch.exp(dA_cs_last - dA_cs_boundary)
+                acc += past_states * scale_state
+
+            if debug:
+                print(f"  Final | acc_mean: {acc.mean().item():.8f}\n")
+            
+            #写入states
+            states[pid_b, pid_h, :, :] = acc
+
+            #仅打印第一个head后退出
+            if debug:
+                break
+
+        #仅打印第一个batch后退出
+        if debug:
+            break
     return states

@@ -976,7 +976,7 @@ class AscendAttnBackend(AttentionBackend):
                 # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
                 # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
                 # Model skywork-reward-gemma2-2-27B also suffers from precision anomalies, thus the torch native backend becomes beneficial approach.
-                if (
+                if  False and (
                     layer.qk_head_dim <= 128
                     and causal
                     and forward_batch.encoder_lens is None
