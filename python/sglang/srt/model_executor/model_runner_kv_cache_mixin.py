@@ -15,8 +15,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
-    HiSparseNSATokenToKVPool,
-    HiSparseTokenToKVPoolAllocator,
+    HiSparseNSATokenToKVPool
 )
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
