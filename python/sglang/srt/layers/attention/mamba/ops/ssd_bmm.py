@@ -128,6 +128,75 @@ def _bmm_chunk_fwd_kernel(
     )
 
 
+def _bmm_chunk_fwd_native(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=None):
+    """
+    PyTorch native implementation of batched matrix multiply for chunks.
+    Avoids Triton compilation issues on Ascend NPU.
+    
+    Argument:
+        a: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
+        b: (batch, seqlen, k) or (batch, seqlen, ngroups, k)
+        seq_idx: (batch, seqlen) or None
+        causal: if True, only lower-triangular part is computed
+    Return:
+        out: (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, ngroups, chunk_size, chunk_size)
+    """
+    has_groups = a.dim() == 4
+    if not has_groups:
+        batch_size, seqlen, k = a.shape
+    else:
+        batch_size, seqlen, ngroups, k = a.shape
+    
+    nchunks = math.ceil(seqlen / chunk_size)
+    out_dtype = a.dtype if output_dtype is None else output_dtype
+    
+    if not has_groups:
+        out = torch.zeros((batch_size, nchunks, chunk_size, chunk_size), device=a.device, dtype=out_dtype)
+    else:
+        out = torch.zeros((batch_size, nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype)
+    
+    for batch_idx in range(batch_size):
+        for c in range(nchunks):
+            start = c * chunk_size
+            end = min(start + chunk_size, seqlen)
+            actual_size = end - start
+            
+            if actual_size <= 0:
+                continue
+            
+            if not has_groups:
+                # a_chunk: (actual_size, k), b_chunk: (actual_size, k)
+                a_chunk = a[batch_idx, start:end, :]  # (actual_size, k)
+                b_chunk = b[batch_idx, start:end, :]  # (actual_size, k)
+                # out_chunk = a_chunk @ b_chunk^T -> (actual_size, actual_size)
+                out_chunk = torch.mm(a_chunk.to(out_dtype), b_chunk.to(out_dtype).t())
+            else:
+                # a_chunk: (actual_size, ngroups, k), b_chunk: (actual_size, ngroups, k)
+                a_chunk = a[batch_idx, start:end, :, :]  # (actual_size, ngroups, k)
+                b_chunk = b[batch_idx, start:end, :, :]  # (actual_size, ngroups, k)
+                # Transpose to (ngroups, actual_size, k) for batched matmul
+                a_t = a_chunk.permute(1, 0, 2).to(out_dtype)  # (ngroups, actual_size, k)
+                b_t = b_chunk.permute(1, 2, 0).to(out_dtype)  # (ngroups, k, actual_size)
+                out_chunk = torch.bmm(a_t, b_t)  # (ngroups, actual_size, actual_size)
+            
+            # Apply seq_idx masking: zero out where seq_idx[i] != seq_idx[j]
+            if seq_idx is not None:
+                seq_chunk = seq_idx[batch_idx, start:end]  # (actual_size,)
+                seq_mask = seq_chunk.unsqueeze(0) == seq_chunk.unsqueeze(1)  # (actual_size, actual_size)
+                if not has_groups:
+                    out_chunk = out_chunk * seq_mask
+                else:
+                    out_chunk = out_chunk * seq_mask.unsqueeze(0)  # (ngroups, actual_size, actual_size)
+            
+            # Store result
+            if not has_groups:
+                out[batch_idx, c, :actual_size, :actual_size] = out_chunk
+            else:
+                out[batch_idx, c, :, :actual_size, :actual_size] = out_chunk
+    
+    return out
+
+
 def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=None):
     """
     Argument:
@@ -139,6 +208,11 @@ def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=No
     Return:
         out: (batch, nchunks, chunk_size, chunk_size) or (batch, nchunks, ngroups, chunk_size, chunk_size)
     """
+    # Check if we're on NPU/Ascend device
+    is_npu = a.device.type == 'npu' or str(a.device).startswith('npu')
+    if is_npu:
+        return _bmm_chunk_fwd_native(a, b, chunk_size, seq_idx=seq_idx, causal=causal, output_dtype=output_dtype)
+    
     # Check constraints.
     has_groups = a.dim() == 4
     if not has_groups:
