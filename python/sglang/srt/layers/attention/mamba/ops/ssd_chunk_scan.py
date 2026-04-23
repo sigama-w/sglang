@@ -92,6 +92,7 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    IS_NPU: tl.constexpr = False,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -135,14 +136,26 @@ def _chunk_scan_fwd_kernel(
     # M-block offsets and prev states
     #  - logic in next block may override these if there is an active offset
     offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-    prev_states_ptr = (
+    
+    # NPU-compatible: compute both pointers outside conditionals
+    chunk_states_ptr_base = (
         states_ptr
         + pid_b * stride_states_batch
         + c_idx * stride_states_chunk
         + pid_h * stride_states_head
     )
-    prev_states_hdim = stride_states_hdim
-    prev_states_dstate = stride_states_dstate
+    
+    if IS_NPU:
+        use_chunk_states = True
+        if HAS_INITSTATES:
+            init_states_ptr_base = (
+                initstates_ptr
+                + pid_h * stride_init_states_head
+            )
+    else:
+        prev_states_ptr = chunk_states_ptr_base
+        prev_states_hdim = stride_states_hdim
+        prev_states_dstate = stride_states_dstate
 
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
     if HAS_SEQ_IDX:
@@ -169,7 +182,18 @@ def _chunk_scan_fwd_kernel(
                 # - recall that in ssd_state_passing, for the case c_off == 0
                 # i.e., the very first sequence, we made states_ptr hold its initial state
                 # so this edge case is taken care of
-                if (
+                if IS_NPU:
+                    # NPU-compatible: track condition, use later with tl.where
+                    use_chunk_states = not (
+                        (c_off == 0 and seq_idx_prev != seq_idx_m)
+                        or (c_off > 0)
+                    )
+                    init_states_ptr_base = (
+                        initstates_ptr
+                        + seq_idx_m * stride_init_states_batch
+                        + pid_h * stride_init_states_head
+                    )
+                elif (
                     (c_off == 0)
                     and (
                         seq_idx_prev != seq_idx_m
@@ -260,10 +284,22 @@ def _chunk_scan_fwd_kernel(
             offs_m[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate
         )
 
-        prev_states_ptrs = prev_states_ptr + (
-            offs_n[None, :] * prev_states_hdim
-            + offs_k_dstate[:, None] * prev_states_dstate
-        )
+        if IS_NPU:
+            # NPU-compatible: compute both pointers, use tl.where to select data
+            chunk_states_ptrs = chunk_states_ptr_base + (
+                offs_n[None, :] * stride_states_hdim
+                + offs_k_dstate[:, None] * stride_states_dstate
+            )
+            if HAS_INITSTATES:
+                init_states_ptrs = init_states_ptr_base + (
+                    offs_n[None, :] * stride_init_states_hdim
+                    + offs_k_dstate[:, None] * stride_init_states_dstate
+                )
+        else:
+            prev_states_ptrs = prev_states_ptr + (
+                offs_n[None, :] * prev_states_hdim
+                + offs_k_dstate[:, None] * prev_states_dstate
+            )
         if HAS_SEQ_IDX:
 
             if not HAS_INITSTATES:
@@ -283,11 +319,28 @@ def _chunk_scan_fwd_kernel(
                 other=0.0,
             )
 
-            prev_states = tl.load(
-                prev_states_ptrs,
-                mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
-                other=0.0,
-            )
+            if IS_NPU:
+                # NPU-compatible: load both and use tl.where
+                prev_states_chunk = tl.load(
+                    chunk_states_ptrs,
+                    mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                    other=0.0,
+                )
+                if HAS_INITSTATES:
+                    prev_states_init = tl.load(
+                        init_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                        other=0.0,
+                    )
+                    prev_states = tl.where(use_chunk_states, prev_states_chunk, prev_states_init)
+                else:
+                    prev_states = prev_states_chunk
+            else:
+                prev_states = tl.load(
+                    prev_states_ptrs,
+                    mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                    other=0.0,
+                )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
         else:
@@ -299,16 +352,40 @@ def _chunk_scan_fwd_kernel(
                     other=0.0,
                 )
                 # C = (C * scale_m[:, None]).to(C_ptr.dtype.element_ty)
-                prev_states = tl.load(
-                    prev_states_ptrs,
-                    mask=(offs_k_dstate[:, None] < dstate - k)
-                    & (offs_n[None, :] < hdim),
-                    other=0.0,
-                )
+                if IS_NPU:
+                    # NPU-compatible: load both and use tl.where
+                    prev_states_chunk = tl.load(
+                        chunk_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate - k)
+                        & (offs_n[None, :] < hdim),
+                        other=0.0,
+                    )
+                    if HAS_INITSTATES:
+                        prev_states_init = tl.load(
+                            init_states_ptrs,
+                            mask=(offs_k_dstate[:, None] < dstate - k)
+                            & (offs_n[None, :] < hdim),
+                            other=0.0,
+                        )
+                        prev_states = tl.where(use_chunk_states, prev_states_chunk, prev_states_init)
+                    else:
+                        prev_states = prev_states_chunk
+                else:
+                    prev_states = tl.load(
+                        prev_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate - k)
+                        & (offs_n[None, :] < hdim),
+                        other=0.0,
+                    )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
                 acc += tl.dot(C, prev_states)
                 C_ptrs += BLOCK_SIZE_K
-                prev_states_ptrs += BLOCK_SIZE_K
+                if IS_NPU:
+                    chunk_states_ptrs += BLOCK_SIZE_K
+                    if HAS_INITSTATES:
+                        init_states_ptrs += BLOCK_SIZE_K
+                else:
+                    prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
 
     offs_k = tl.arange(0, BLOCK_SIZE_K) + c_off
@@ -416,220 +493,7 @@ def _chunk_scan_fwd_kernel(
         out_ptrs,
         acc,
         mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim),
-    )
-
-
-def _chunk_scan_fwd_native(
-    cb,
-    x,
-    dt,
-    dA_cumsum,
-    C,
-    states,
-    D=None,
-    z=None,
-    seq_idx=None,
-    chunk_indices=None,
-    chunk_offsets=None,
-    initial_states=None,
-    out=None,
-):
-    """
-    PyTorch native implementation of chunk scan forward pass.
-    This avoids Triton compilation issues on Ascend NPU.
-    
-    Handles pseudo-chunk mechanism for continuous batching:
-    When chunk_indices/chunk_offsets are provided, iterates over logical chunks
-    (which handle sequence boundaries within physical chunks) instead of
-    physical chunks directly.
-    """
-    batch, seqlen, nheads, headdim = x.shape
-    _, _, nchunks, chunk_size = dt.shape
-    _, _, ngroups, dstate = C.shape
-    nheads_ngroups_ratio = nheads // ngroups
-    
-    assert nheads % ngroups == 0
-    assert C.shape == (batch, seqlen, ngroups, dstate)
-    assert cb.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
-    if z is not None:
-        assert z.shape == x.shape
-    if D is not None:
-        assert D.shape == (nheads, headdim) or D.shape == (nheads,)
-    assert dt.shape == (batch, nheads, nchunks, chunk_size)
-    assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
-    assert states.shape == (batch, nchunks, nheads, headdim, dstate)
-    assert out.shape == x.shape
-    
-    # Handle seq_idx and initial_states
-    has_initial_states = False
-    if seq_idx is not None:
-        assert seq_idx.shape == (batch, seqlen)
-        if initial_states is not None:
-            assert batch == 1, "chunk scan only supports initial states with batch 1"
-            assert chunk_indices is not None and chunk_offsets is not None
-            has_initial_states = True
-        else:
-            chunk_indices, chunk_offsets = None, None
-    else:
-        chunk_indices, chunk_offsets = None, None
-    
-    # Prepare output
-    if z is not None:
-        out_x = torch.empty_like(x)
-    else:
-        out_x = None
-    
-    def _process_logical_chunk(b, c_idx, c_off, chunk_size_limit, prev_states_chunk):
-        """Process a single logical chunk. All intermediates computed in float32 to match Triton."""
-        n_pos = chunk_size_limit - c_off
-        if n_pos <= 0:
-            return
-        
-        start_pos = c_idx * chunk_size + c_off
-        end_pos = start_pos + n_pos
-        
-        # Get chunk data — convert to float32 for computation (Triton uses float32 accumulators)
-        x_chunk = x[b, start_pos:end_pos, :, :].float()  # (n_pos, nheads, headdim)
-        C_chunk = C[b, start_pos:end_pos, :, :].float()  # (n_pos, ngroups, dstate)
-        dt_chunk = dt[b, :, c_idx, c_off:c_off + n_pos].float()  # (nheads, n_pos)
-        dA_cs_chunk = dA_cumsum[b, :, c_idx, c_off:c_off + n_pos]  # (nheads, n_pos) already float32
-        cb_chunk = cb[b, c_idx, :, c_off:c_off + n_pos, c_off:c_off + n_pos].float()  # (ngroups, n_pos, n_pos)
-        
-        # Expand C for all heads: (n_pos, ngroups, dstate) -> (n_pos, nheads, dstate)
-        C_expanded = C_chunk.unsqueeze(2).expand(-1, -1, nheads_ngroups_ratio, -1)
-        C_expanded = C_expanded.reshape(n_pos, nheads, dstate)
-        
-        # Expand cb for all heads: (ngroups, n_pos, n_pos) -> (nheads, n_pos, n_pos)
-        cb_expanded = cb_chunk.unsqueeze(1).expand(-1, nheads_ngroups_ratio, -1, -1)
-        cb_expanded = cb_expanded.reshape(nheads, n_pos, n_pos)
-        
-        # Compute dA_cs_boundary for offset correction
-        if c_off > 0:
-            dA_cs_boundary = dA_cumsum[b, :, c_idx, c_off - 1]  # (nheads,) float32
-        else:
-            dA_cs_boundary = torch.zeros(nheads, device=x.device, dtype=torch.float32)
-        
-        # Compute scale_m for C @ states contribution
-        if has_initial_states:
-            # With initial states: scale = exp(dA_cs - boundary)
-            scale = torch.exp(dA_cs_chunk - dA_cs_boundary.unsqueeze(-1))  # (nheads, n_pos)
-        elif seq_idx is not None:
-            # Without initial states but with seq_idx:
-            # Zero out contribution if sequence changed at chunk boundary
-            if c_idx > 0:
-                seq_idx_prev = seq_idx[b, c_idx * chunk_size - 1]
-            else:
-                seq_idx_prev = 0
-            seq_idx_m = seq_idx[b, start_pos:end_pos]  # (n_pos,)
-            # scale = where(seq_idx_m == seq_idx_prev, exp(dA_cs), 0)
-            seq_match = (seq_idx_m == seq_idx_prev).unsqueeze(0)  # (1, n_pos)
-            scale = torch.where(seq_match, torch.exp(dA_cs_chunk), torch.zeros_like(dA_cs_chunk))
-        else:
-            scale = torch.exp(dA_cs_chunk)  # (nheads, n_pos)
-        
-        # Part 1: C @ prev_states * scale (all in float32)
-        # prev_states_chunk: (nheads, headdim, dstate)
-        C_t = C_expanded.transpose(0, 1)  # (nheads, n_pos, dstate) float32
-        states_t = prev_states_chunk.float().transpose(1, 2)  # (nheads, dstate, headdim) float32
-        C_states = torch.bmm(C_t, states_t)  # (nheads, n_pos, headdim) float32
-        C_states = C_states * scale.unsqueeze(-1)  # apply scale
-        C_states = C_states.transpose(0, 1)  # (n_pos, nheads, headdim)
-        
-        # Part 2: causal cb @ x with dt and dA_cs weighting
-        # IMPORTANT: Must apply causal mask BEFORE exp to avoid overflow.
-        # In the upper triangle (m < k), dA_cs_m - dA_cs_k is large positive,
-        # which causes exp() to overflow to inf. Then inf * 0 (causal mask) = NaN.
-        # The Triton kernel avoids this by never computing the upper triangle at all.
-        causal_mask = torch.tril(torch.ones(n_pos, n_pos, device=x.device, dtype=torch.bool)).unsqueeze(0)  # (1, n_pos, n_pos)
-        dA_cs_m = dA_cs_chunk.unsqueeze(-1)  # (nheads, n_pos, 1)
-        dA_cs_k = dA_cs_chunk.unsqueeze(1)   # (nheads, 1, n_pos)
-        dt_expanded = dt_chunk.unsqueeze(1)   # (nheads, 1, n_pos) - dt at K positions, broadcast over M
-        dA_diff = dA_cs_m - dA_cs_k  # (nheads, n_pos, n_pos)
-        # Zero upper triangle before exp to prevent overflow (exp(0)=1, safe)
-        dA_diff = dA_diff.masked_fill(~causal_mask, 0.0)
-        cb_scaled = cb_expanded * torch.exp(dA_diff) * dt_expanded
-        # Zero upper triangle of result (where exp gave 1 instead of needed 0)
-        cb_scaled = cb_scaled.masked_fill(~causal_mask, 0.0)
-        
-        # cb @ x: (nheads, n_pos, n_pos) @ (nheads, n_pos, headdim) — all float32
-        x_chunk_t = x_chunk.transpose(0, 1)  # (nheads, n_pos, headdim) float32
-        cb_x = torch.bmm(cb_scaled, x_chunk_t)  # (nheads, n_pos, headdim) float32
-        cb_x = cb_x.transpose(0, 1)  # (n_pos, nheads, headdim)
-        
-        # Combine
-        out_chunk = C_states + cb_x
-        
-        # Add D term (convert D to float32 to match out_chunk on NPU)
-        if D is not None:
-            if D.dim() == 2:
-                D_exp = D.float().unsqueeze(0)  # (1, nheads, headdim)
-            else:
-                D_exp = D.float().unsqueeze(0).unsqueeze(-1)  # (1, nheads, 1)
-            out_chunk = out_chunk + x_chunk * D_exp
-        
-        # Apply SiLU gating (convert z to float32 to avoid mixed dtype on NPU)
-        if z is not None:
-            z_chunk = z[b, start_pos:end_pos, :, :].float()
-            if out_x is not None:
-                out_x[b, start_pos:end_pos, :, :] = out_chunk
-            z_silu = z_chunk * torch.sigmoid(z_chunk)
-            out_chunk = out_chunk * z_silu
-        
-        out[b, start_pos:end_pos, :, :] = out_chunk
-    
-    # Main loop
-    if not has_initial_states:
-        # Standard path: iterate over physical chunks
-        for b in range(batch):
-            for c in range(nchunks):
-                chunk_size_limit = min(chunk_size, seqlen - c * chunk_size)
-                if chunk_size_limit <= 0:
-                    continue
-                prev_states = states[b, c, :, :, :]  # (nheads, headdim, dstate)
-                _process_logical_chunk(b, c, 0, chunk_size_limit, prev_states)
-    else:
-        # Pseudo-chunk path: iterate over logical chunks
-        num_logical_chunks = len(chunk_indices)
-        for b in range(batch):
-            for lc in range(num_logical_chunks):
-                c_idx = chunk_indices[lc].item()
-                c_off = chunk_offsets[lc].item()
-                
-                # Determine chunk_size_limit
-                chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
-                
-                # If next logical chunk is in same physical chunk, limit to its offset
-                if lc + 1 < num_logical_chunks:
-                    c_idx_next = chunk_indices[lc + 1].item()
-                    if c_idx == c_idx_next:
-                        c_off_next = chunk_offsets[lc + 1].item()
-                        chunk_size_limit = min(c_off_next, chunk_size_limit)
-                
-                if chunk_size_limit - c_off <= 0:
-                    continue
-                
-                # Determine prev_states: use states or initial_states
-                start_pos = c_idx * chunk_size + c_off
-                prev_states = states[b, c_idx, :, :, :]  # default
-                
-                # Check if we need to use initial_states at sequence boundary
-                if c_idx > 0:
-                    seq_idx_prev = seq_idx[b, c_idx * chunk_size - 1].item()
-                else:
-                    seq_idx_prev = 0
-                
-                if start_pos < seqlen:
-                    seq_idx_m = seq_idx[b, start_pos].item()
-                else:
-                    seq_idx_m = seq_idx_prev
-                
-                # Replace with initial_states if at sequence boundary
-                if (c_off == 0 and seq_idx_prev != seq_idx_m) or c_off > 0:
-                    prev_states = initial_states[seq_idx_m, :, :, :]  # (nheads, headdim, dstate)
-                
-                _process_logical_chunk(b, c_idx, c_off, chunk_size_limit, prev_states)
-    
-    return out_x
+)
 
 
 def _chunk_scan_fwd(
@@ -648,21 +512,10 @@ def _chunk_scan_fwd(
     out=None,
 ):
     """
-    Chunk scan forward pass with fallback to native implementation on Ascend NPU.
+    Chunk scan forward pass.
     """
-    # Check if we're on NPU/Ascend device
-    is_npu = x.device.type == 'npu' or str(x.device).startswith('npu')
+    is_npu_device = x.device.type == 'npu' or str(x.device).startswith('npu')
     
-    # Use native implementation for NPU to avoid Triton SIGSEGV
-    if is_npu:
-        return _chunk_scan_fwd_native(
-            cb, x, dt, dA_cumsum, C, states,
-            D=D, z=z, seq_idx=seq_idx,
-            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
-            initial_states=initial_states, out=out
-        )
-    
-    # Original Triton implementation for CUDA/GPU
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
@@ -787,5 +640,6 @@ def _chunk_scan_fwd(
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        IS_NPU=is_npu_device,
     )
     return out_x
