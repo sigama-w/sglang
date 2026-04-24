@@ -14,7 +14,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
 from .mamba_ssm import softplus
+
+SSD_BLOCK_SIZE_H = 2 if is_npu() else 16
 
 
 @triton.jit
@@ -303,6 +306,7 @@ def _chunk_state_varlen_kernel(
     stride_init_states_dstate,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    IS_NPU: tl.constexpr = False,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -389,45 +393,101 @@ def _chunk_state_varlen_kernel(
     # If HAS_INITSTATES==True need to consider two possibilities
     # - if start_idx < pid_c * chunk_size, then we need to take the past_states_ptrs
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
-    if (start_idx < pid_c * chunk_size) or (HAS_INITSTATES):  # first chunk
 
-        dA_cs_boundary = 0.0  # default
-
-        if not HAS_INITSTATES:
-            past_states_ptrs = chunk_states_ptr + (
-                offs_m[:, None] * stride_chunk_states_hdim
-                + offs_n[None, :] * stride_chunk_states_dstate
+    if IS_NPU:
+        # NPU-compatible logic: NO runtime conditionals with pointer operations
+        # All pointers computed outside, all runtime selections via tl.where
+        
+        use_chunk_states = start_idx < pid_c * chunk_size
+        need_boundary = start_idx > pid_c * chunk_size
+        
+        # Always compute chunk_states_ptrs
+        chunk_states_ptrs = chunk_states_ptr + (
+            offs_m[:, None] * stride_chunk_states_hdim
+            + offs_n[None, :] * stride_chunk_states_dstate
+        )
+        
+        # Load chunk states unconditionally
+        past_states_chunk = tl.load(
+            chunk_states_ptrs,
+            mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
+            other=0.0,
+        ).to(tl.float32)
+        
+        if HAS_INITSTATES:
+            # Compute init_states_ptrs (this is compile-time branch)
+            init_states_ptrs = initstates_ptr + (
+                pid_b * stride_init_states_batch
+                + offs_m[:, None] * stride_init_states_hdim
+                + offs_n[None, :] * stride_init_states_dstate
             )
+            
+            # Load init states unconditionally
+            past_states_init = tl.load(
+                init_states_ptrs,
+                mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
+                other=0.0,
+            ).to(tl.float32)
+            
+            # Select data via tl.where (runtime selection without control flow)
+            past_states = tl.where(use_chunk_states, past_states_chunk, past_states_init)
+            
+            # Load dA_cs_boundary conditionally via tl.where
+            # Compute pointer for boundary load
+            dA_cs_boundary_idx = start_idx - pid_c * chunk_size - 1
+            dA_cs_boundary_val = tl.load(
+                dA_cumsum_ptr + dA_cs_boundary_idx * stride_dA_cs_csize,
+                mask=need_boundary,
+                other=0.0,
+            ).to(tl.float32)
+            dA_cs_boundary = tl.where(need_boundary, dA_cs_boundary_val, 0.0)
+            
+            scale = tl.exp(dA_cs_last - dA_cs_boundary)
+            acc += past_states * scale
         else:
+            # No HAS_INITSTATES: use tl.where for runtime selection
+            # When use_chunk_states=False, scale=0, so contribution is zero
+            scale = tl.where(use_chunk_states, tl.exp(dA_cs_last), 0.0)
+            acc += past_states_chunk * scale[:, None]
+    else:
+        # Original GPU logic
+        if (start_idx < pid_c * chunk_size) or (HAS_INITSTATES):
 
-            # - this seems repetitive, buts its to help the compiler
-            if start_idx < pid_c * chunk_size:
+            dA_cs_boundary = 0.0
+
+            if not HAS_INITSTATES:
                 past_states_ptrs = chunk_states_ptr + (
                     offs_m[:, None] * stride_chunk_states_hdim
                     + offs_n[None, :] * stride_chunk_states_dstate
                 )
             else:
-                past_states_ptrs = initstates_ptr + (
-                    pid_b * stride_init_states_batch
-                    + offs_m[:, None] * stride_init_states_hdim
-                    + offs_n[None, :] * stride_init_states_dstate
-                )
 
-                # need to adjust the boundary
-                if start_idx > pid_c * chunk_size:
-                    dA_cs_boundary = tl.load(
-                        dA_cumsum_ptr
-                        + (start_idx - pid_c * chunk_size - 1) * stride_dA_cs_csize
-                    ).to(tl.float32)
+                if start_idx < pid_c * chunk_size:
+                    past_states_ptrs = chunk_states_ptr + (
+                        offs_m[:, None] * stride_chunk_states_hdim
+                        + offs_n[None, :] * stride_chunk_states_dstate
+                    )
+                else:
+                    past_states_ptrs = initstates_ptr + (
+                        pid_b * stride_init_states_batch
+                        + offs_m[:, None] * stride_init_states_hdim
+                        + offs_n[None, :] * stride_init_states_dstate
+                    )
 
-        past_states = tl.load(
-            past_states_ptrs,
-            mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
-            other=0.0,
-        ).to(tl.float32)
+                    if start_idx > pid_c * chunk_size:
+                        dA_cs_boundary = tl.load(
+                            dA_cumsum_ptr
+                            + (start_idx - pid_c * chunk_size - 1) * stride_dA_cs_csize
+                        ).to(tl.float32)
 
-        scale = tl.exp(dA_cs_last - dA_cs_boundary)
-        acc += past_states * scale
+            past_states = tl.load(
+                past_states_ptrs,
+                mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
+                other=0.0,
+            ).to(tl.float32)
+
+            scale = tl.exp(dA_cs_last - dA_cs_boundary)
+            acc += past_states * scale
 
     states = acc.to(states_ptr.dtype.element_ty)
 
@@ -489,6 +549,7 @@ def _chunk_cumsum_fwd(
             dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
+            BLOCK_SIZE_H=SSD_BLOCK_SIZE_H,
         )
     return dA_cumsum, dt_out
 
@@ -568,6 +629,7 @@ def _chunk_state_fwd(
 def chunk_state_varlen(
     B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
 ):
+    is_npu_device = x.device.type == 'npu' or str(x.device).startswith('npu')
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -642,5 +704,6 @@ def chunk_state_varlen(
                 else (0, 0, 0, 0)
             ),
             HAS_INITSTATES=initial_states is not None,
+            IS_NPU=is_npu_device,
         )
     return states

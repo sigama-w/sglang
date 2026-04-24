@@ -92,6 +92,7 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    IS_NPU: tl.constexpr = False,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -135,14 +136,26 @@ def _chunk_scan_fwd_kernel(
     # M-block offsets and prev states
     #  - logic in next block may override these if there is an active offset
     offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-    prev_states_ptr = (
+    
+    # NPU-compatible: compute both pointers outside conditionals
+    chunk_states_ptr_base = (
         states_ptr
         + pid_b * stride_states_batch
         + c_idx * stride_states_chunk
         + pid_h * stride_states_head
     )
-    prev_states_hdim = stride_states_hdim
-    prev_states_dstate = stride_states_dstate
+    
+    if IS_NPU:
+        use_chunk_states = True
+        if HAS_INITSTATES:
+            init_states_ptr_base = (
+                initstates_ptr
+                + pid_h * stride_init_states_head
+            )
+    else:
+        prev_states_ptr = chunk_states_ptr_base
+        prev_states_hdim = stride_states_hdim
+        prev_states_dstate = stride_states_dstate
 
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
     if HAS_SEQ_IDX:
@@ -169,7 +182,18 @@ def _chunk_scan_fwd_kernel(
                 # - recall that in ssd_state_passing, for the case c_off == 0
                 # i.e., the very first sequence, we made states_ptr hold its initial state
                 # so this edge case is taken care of
-                if (
+                if IS_NPU:
+                    # NPU-compatible: track condition, use later with tl.where
+                    use_chunk_states = not (
+                        (c_off == 0 and seq_idx_prev != seq_idx_m)
+                        or (c_off > 0)
+                    )
+                    init_states_ptr_base = (
+                        initstates_ptr
+                        + seq_idx_m * stride_init_states_batch
+                        + pid_h * stride_init_states_head
+                    )
+                elif (
                     (c_off == 0)
                     and (
                         seq_idx_prev != seq_idx_m
@@ -260,10 +284,22 @@ def _chunk_scan_fwd_kernel(
             offs_m[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate
         )
 
-        prev_states_ptrs = prev_states_ptr + (
-            offs_n[None, :] * prev_states_hdim
-            + offs_k_dstate[:, None] * prev_states_dstate
-        )
+        if IS_NPU:
+            # NPU-compatible: compute both pointers, use tl.where to select data
+            chunk_states_ptrs = chunk_states_ptr_base + (
+                offs_n[None, :] * stride_states_hdim
+                + offs_k_dstate[:, None] * stride_states_dstate
+            )
+            if HAS_INITSTATES:
+                init_states_ptrs = init_states_ptr_base + (
+                    offs_n[None, :] * stride_init_states_hdim
+                    + offs_k_dstate[:, None] * stride_init_states_dstate
+                )
+        else:
+            prev_states_ptrs = prev_states_ptr + (
+                offs_n[None, :] * prev_states_hdim
+                + offs_k_dstate[:, None] * prev_states_dstate
+            )
         if HAS_SEQ_IDX:
 
             if not HAS_INITSTATES:
@@ -283,11 +319,28 @@ def _chunk_scan_fwd_kernel(
                 other=0.0,
             )
 
-            prev_states = tl.load(
-                prev_states_ptrs,
-                mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
-                other=0.0,
-            )
+            if IS_NPU:
+                # NPU-compatible: load both and use tl.where
+                prev_states_chunk = tl.load(
+                    chunk_states_ptrs,
+                    mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                    other=0.0,
+                )
+                if HAS_INITSTATES:
+                    prev_states_init = tl.load(
+                        init_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                        other=0.0,
+                    )
+                    prev_states = tl.where(use_chunk_states, prev_states_chunk, prev_states_init)
+                else:
+                    prev_states = prev_states_chunk
+            else:
+                prev_states = tl.load(
+                    prev_states_ptrs,
+                    mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                    other=0.0,
+                )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
         else:
@@ -299,16 +352,40 @@ def _chunk_scan_fwd_kernel(
                     other=0.0,
                 )
                 # C = (C * scale_m[:, None]).to(C_ptr.dtype.element_ty)
-                prev_states = tl.load(
-                    prev_states_ptrs,
-                    mask=(offs_k_dstate[:, None] < dstate - k)
-                    & (offs_n[None, :] < hdim),
-                    other=0.0,
-                )
+                if IS_NPU:
+                    # NPU-compatible: load both and use tl.where
+                    prev_states_chunk = tl.load(
+                        chunk_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate - k)
+                        & (offs_n[None, :] < hdim),
+                        other=0.0,
+                    )
+                    if HAS_INITSTATES:
+                        prev_states_init = tl.load(
+                            init_states_ptrs,
+                            mask=(offs_k_dstate[:, None] < dstate - k)
+                            & (offs_n[None, :] < hdim),
+                            other=0.0,
+                        )
+                        prev_states = tl.where(use_chunk_states, prev_states_chunk, prev_states_init)
+                    else:
+                        prev_states = prev_states_chunk
+                else:
+                    prev_states = tl.load(
+                        prev_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate - k)
+                        & (offs_n[None, :] < hdim),
+                        other=0.0,
+                    )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
                 acc += tl.dot(C, prev_states)
                 C_ptrs += BLOCK_SIZE_K
-                prev_states_ptrs += BLOCK_SIZE_K
+                if IS_NPU:
+                    chunk_states_ptrs += BLOCK_SIZE_K
+                    if HAS_INITSTATES:
+                        init_states_ptrs += BLOCK_SIZE_K
+                else:
+                    prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
 
     offs_k = tl.arange(0, BLOCK_SIZE_K) + c_off
@@ -434,6 +511,7 @@ def _chunk_scan_fwd(
     initial_states=None,
     out=None,
 ):
+    is_npu_device = x.device.type == 'npu' or str(x.device).startswith('npu')
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
@@ -558,5 +636,6 @@ def _chunk_scan_fwd(
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        IS_NPU=is_npu_device,
     )
     return out_x
