@@ -1880,7 +1880,7 @@ class AscendAttnBackend(AttentionBackend):
             elif (
                 forward_batch.encoder_lens is None
                 and layer.logit_cap == 0
-                and getattr(self, "use_npu_paged_attention", False)
+                and getattr(self, "use_npu_paged_attention", True)
             ):
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]

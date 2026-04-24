@@ -136,7 +136,7 @@ def _chunk_scan_fwd_kernel(
     # M-block offsets and prev states
     #  - logic in next block may override these if there is an active offset
     offs_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
-    
+
     # NPU-compatible: compute both pointers outside conditionals
     chunk_states_ptr_base = (
         states_ptr
@@ -144,14 +144,11 @@ def _chunk_scan_fwd_kernel(
         + c_idx * stride_states_chunk
         + pid_h * stride_states_head
     )
-    
+
     if IS_NPU:
         use_chunk_states = True
         if HAS_INITSTATES:
-            init_states_ptr_base = (
-                initstates_ptr
-                + pid_h * stride_init_states_head
-            )
+            init_states_ptr_base = initstates_ptr + pid_h * stride_init_states_head
     else:
         prev_states_ptr = chunk_states_ptr_base
         prev_states_hdim = stride_states_hdim
@@ -185,8 +182,7 @@ def _chunk_scan_fwd_kernel(
                 if IS_NPU:
                     # NPU-compatible: track condition, use later with tl.where
                     use_chunk_states = not (
-                        (c_off == 0 and seq_idx_prev != seq_idx_m)
-                        or (c_off > 0)
+                        (c_off == 0 and seq_idx_prev != seq_idx_m) or (c_off > 0)
                     )
                     init_states_ptr_base = (
                         initstates_ptr
@@ -329,10 +325,13 @@ def _chunk_scan_fwd_kernel(
                 if HAS_INITSTATES:
                     prev_states_init = tl.load(
                         init_states_ptrs,
-                        mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                        mask=(offs_k_dstate[:, None] < dstate)
+                        & (offs_n[None, :] < hdim),
                         other=0.0,
                     )
-                    prev_states = tl.where(use_chunk_states, prev_states_chunk, prev_states_init)
+                    prev_states = tl.where(
+                        use_chunk_states, prev_states_chunk, prev_states_init
+                    )
                 else:
                     prev_states = prev_states_chunk
             else:
@@ -367,7 +366,9 @@ def _chunk_scan_fwd_kernel(
                             & (offs_n[None, :] < hdim),
                             other=0.0,
                         )
-                        prev_states = tl.where(use_chunk_states, prev_states_chunk, prev_states_init)
+                        prev_states = tl.where(
+                            use_chunk_states, prev_states_chunk, prev_states_init
+                        )
                     else:
                         prev_states = prev_states_chunk
                 else:
@@ -511,7 +512,7 @@ def _chunk_scan_fwd(
     initial_states=None,
     out=None,
 ):
-    is_npu_device = x.device.type == 'npu' or str(x.device).startswith('npu')
+    is_npu_device = x.device.type == "npu" or str(x.device).startswith("npu")
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
