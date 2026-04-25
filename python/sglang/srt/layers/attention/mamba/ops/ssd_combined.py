@@ -16,9 +16,9 @@ from sglang.srt.utils import is_cuda, is_npu
 
 from .ssd_bmm import _bmm_chunk_fwd
 
-if is_cuda:
+if is_cuda():
     from .ssd_chunk_scan import _chunk_scan_fwd
-elif is_npu:
+elif is_npu():
      from sgl_kernel_npu.mamba.ssd_chunk_scan import _chunk_scan_fwd
 
 if is_cuda():
