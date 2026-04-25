@@ -33,7 +33,6 @@ elif is_npu():
         _chunk_state_fwd,
         chunk_state_varlen
     )
-    print("enter npu")
 
 from .ssd_state_passing import _state_passing_fwd
 
