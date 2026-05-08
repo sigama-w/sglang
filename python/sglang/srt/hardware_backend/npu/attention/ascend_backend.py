@@ -948,8 +948,6 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        # logger.info(f"======================= in AscendAttenBackend.forward_extend line 1")
-        # logger.info(f"======================= self.use_mla = {self.use_mla}")
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
@@ -1006,15 +1004,6 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            
-            # logger.info(f"================================================================================")
-            # logger.info(f"==========================q:{q.shape}")
-            # logger.info(f"==========================k_cache:{k_cache.shape}")
-            # logger.info(f"==========================v_cache:{v_cache.shape}")
-            # logger.info(f"==========================self.forward_metadata:{self.forward_metadata}")
-            # logger.info(f"==========================layer.sliding_window_size:{layer.sliding_window_size}")
-            # logger.info(f"==========================layer.tp_q_head_num:{layer.tp_q_head_num}")
-            # logger.info(f"==========================layer.tp_k_head_num:{layer.tp_k_head_num}")
             
             if sinks is not None:
                 if self.is_hybrid_swa and layer.sliding_window_size != -1:
@@ -1081,7 +1070,6 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
-                #logger.info("================================causal========================")
                 causal = True
                 if (
                     layer.is_cross_attention
@@ -1105,8 +1093,6 @@ class AscendAttnBackend(AttentionBackend):
                             dtype=query.dtype,
                             device=query.device,
                         )
-                        #!!!
-                        logger.info(f"=================================torch_npu._npu_flash_attention_qlens")
                         torch_npu._npu_flash_attention_qlens(
                             query=query,
                             key_cache=k_cache,
@@ -1121,7 +1107,6 @@ class AscendAttnBackend(AttentionBackend):
                             out=attn_output,
                         )
                     else:
-                        logger.info(f"=================================self.attn_alibi")
                         attn_output = self.attn_alibi(
                             q=q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim),
                             k_cache=k_cache,
@@ -1135,9 +1120,6 @@ class AscendAttnBackend(AttentionBackend):
                             is_extend=True,
                         )
                 else:
-                    # 
-                    # logger.info(f"======================================layer.qk_head_dim:{layer.qk_head_dim}")
-                    # logger.info(f"======================================layer.v_head_dim:{layer.v_head_dim}")
                     if layer.qk_head_dim != layer.v_head_dim:
                         attn_output = q.new_empty(
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -1151,13 +1133,8 @@ class AscendAttnBackend(AttentionBackend):
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
                     # add forward_batch.encoder_lens and is_cross_attention arguments for cross attention scene
-                    #logger.info(f"=====================================run_sdpa_forward_extend")
-                    # logger.info(f"=====================================k_cache：{k_cache.shape}")
-                    # logger.info(f"=====================================v_cache：{v_cache.shape}")
                     k_c = k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
                     v_c = v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim)
-                    # logger.info(f"=====================================k_c：{k_c.shape}")
-                    # logger.info(f"=====================================v_c：{v_c.shape}")
                     attn_output = self.native_attn.run_sdpa_forward_extend(
                         q_,
                         o_,
@@ -1180,7 +1157,6 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
-            logger.info("========================================branch sum(forward_batch.extend_prefix_lens_cpu) > 0")
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
             # we use the FIA kernel for computation.
@@ -1358,7 +1334,6 @@ class AscendAttnBackend(AttentionBackend):
                         dim=0,
                     )
         else:
-            logger.info("========================================layer.qk_head_dim == layer.v_head_dim")
             if layer.qk_head_dim == layer.v_head_dim:
                 """FIA will support multi-bs in the later version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -1981,7 +1956,6 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_out
 
             if self.use_fia:
-                logger.info("================================forward decode--self.use_fia")
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
@@ -2022,9 +1996,6 @@ class AscendAttnBackend(AttentionBackend):
                         dtype=query.dtype,
                         device=query.device,
                     )
-                    #logger.info(f"=============================k_cache dim:{k_cache.shape}")
-                    #logger.info(f"=============================v_cache dim:{v_cache.shape}")
-                   # logger.info("===================================Into  torch_npu._npu_paged_attention")
                     torch_npu._npu_paged_attention(
                         query=query,
                         key_cache=k_cache,
@@ -2050,7 +2021,6 @@ class AscendAttnBackend(AttentionBackend):
                         is_extend=False,
                     )
             else:
-                logger.info("================================forward decode-- if layer.qk_head_dim != layer.v_head_dim:")
                 if layer.qk_head_dim != layer.v_head_dim:
                     attn_output = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)

@@ -64,22 +64,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
             # while other backends remain unchanged.
-            
-            # self.kv_buffer = torch.zeros(
-            #     (
-            #         2,
-            #         self.layer_num,
-            #         self.size // self.page_size + 1,
-            #         self.page_size,
-            #         self.head_num,
-            #         self.head_dim,
-            #     ),
-            #     dtype=self.store_dtype,
-            #     device=self.device,
-            # )
-            # self.k_buffer = self.kv_buffer[0]
-            # self.v_buffer = self.kv_buffer[1]
-            
             self.k_buffer = [
                     torch.zeros(
                         (self.size // self.page_size + 1 ,self.page_size, self.head_num, self.head_dim),
@@ -112,8 +96,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
         kv_data_ptrs = [
             self.get_key_buffer(i).data_ptr()
             for i in range(self.start_layer, self.start_layer + self.layer_num)
@@ -173,7 +155,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.use_fia:
-            #logger.info(f"========================================use_fia:{self.use_fia}")
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
 
@@ -189,12 +170,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             )
         else:
             loc = loc.to(torch.int32)
-            #logger.info(f"================================self.v_buffer shape:{self.v_buffer[layer_id - self.start_layer].shape}")
-            
-            # logger.info(f"[SET_KV] k_buffer shape: {self.k_buffer[layer_id - self.start_layer].shape}")
-            # logger.info(f"[SET_KV] k_buffer view shape: {self.k_buffer[layer_id - self.start_layer].view(-1, self.page_size, self.head_num, self.head_dim).shape}")
-            # logger.info(f"[SET_KV] cache_k shape: {cache_k.shape}")
-            
+
             torch_npu._npu_reshape_and_cache(
                 key=cache_k,
                 value=cache_v,
@@ -207,40 +183,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 slot_indices=loc,
             )
 
-
-    # def get_key_buffer(self, layer_id: int):
-        
-    #     if self.layer_transfer_counter is not None:
-    #         self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        
-    #     k_buffer = self.k_buffer[layer_id - self.start_layer]
-        
-    #     if self.store_dtype != self.dtype:
-    #         k_buffer = k_buffer.view(self.dtype)
-        
-    #     if self.use_fia:
-    #         return k_buffer
-    #     else:
-    #         result = k_buffer.view(-1, self.page_size, self.head_num, self.head_dim)
-    #         #logger.info(f"[GET_KV] layer={layer_id}, shape={result.shape}")
-    #         return k_buffer.view(-1, self.page_size, self.head_num, self.head_dim)
-        
-
-    # def get_value_buffer(self, layer_id: int):
-        
-    #     if self.layer_transfer_counter is not None:
-    #         self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        
-    #     v_buffer = self.v_buffer[layer_id - self.start_layer]
-    
-    #     if self.store_dtype != self.dtype:
-    #         v_buffer = v_buffer.view(self.dtype)
-        
-    #     if self.use_fia:
-    #         return v_buffer
-    #     else:
-    #         return v_buffer.view(-1, self.page_size, self.head_num, self.v_head_dim)
-    
 class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def __init__(
