@@ -10,15 +10,15 @@ This guide describes the best practice data for MiMo-V2-Flash on the Ascend NPU.
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 16K+1 | 974ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-16k1-974ms-on-a3-24-cards-disaggregation-mode) |
-| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 32K+1 | 2,147ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-32k1-2147ms-on-a3-24-cards-disaggregation-mode) |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 16K+1 | 974ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode) |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 32K+1 | 2,147ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-32k-1-2147ms-on-a3-24-cards-disaggregation-mode) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 16K+1K | 16ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-16k1k-16ms-on-a3-24-cards-disaggregation-mode) |
-| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 32K+1K | 12ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-32k1k-12ms-on-a3-24-cards-disaggregation-mode) |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 16K+1K | 16ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-16k-1k-16ms-on-a3-24-cards-disaggregation-mode) |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 32K+1K | 12ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-32k-1k-12ms-on-a3-24-cards-disaggregation-mode) |
 
 ## Optimal Configuration
 
@@ -92,6 +92,8 @@ do
         export HCCL_OP_EXPANSION_MODE=AIV
         export HCCL_SOCKET_IFNAME=<network-interface>
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export SGLANG_NPU_PROFILING=0
+        export SGLANG_NPU_PROFILING_STAGE="prefill"
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
         export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
@@ -224,7 +226,7 @@ python3 -m sglang.bench_serving \
 
 #### Model Deployment
 
-Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k1-974ms-on-a3-24-cards-disaggregation-mode).
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
 
 #### Benchmark
 
@@ -265,7 +267,7 @@ python3 -m sglang.bench_serving \
 
 #### Model Deployment
 
-Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k1-974ms-on-a3-24-cards-disaggregation-mode).
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
 
 #### Benchmark
 
@@ -306,7 +308,7 @@ python3 -m sglang.bench_serving \
 
 #### Model Deployment
 
-Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k1-974ms-on-a3-24-cards-disaggregation-mode).
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
 
 #### Benchmark
 
