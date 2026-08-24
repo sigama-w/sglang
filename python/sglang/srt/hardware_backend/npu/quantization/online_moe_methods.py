@@ -37,6 +37,87 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         super().__init__()
         self.quant_config = quant_config
+        # True when the checkpoint holds FP8 weights + float32 scales and needs
+        # dequantization to BF16 before MXFP8 requantization.
+        self._fp8_checkpoint = bool(
+            quant_config is not None
+            and getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        if self._fp8_checkpoint:
+            # FP8 checkpoint: create float8_e4m3fn weight + float32 scale params
+            # so the loader can populate them; dequant→BF16→MXFP8 happens in
+            # process_weights_after_loading.
+            from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+            quant_config = self.quant_config
+            block_quant = quant_config.weight_block_size is not None
+            Fp8MoEMethod.create_fp8_moe_weight_(
+                layer=layer,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                block_quant=block_quant,
+                quant_config=quant_config,
+                use_mxfp8=False,  # standard FP8: float32 scales, not uint8 e8m0
+                is_checkpoint_fp8_serialized=True,
+                is_fp4_expert=False,
+                params_dtype=params_dtype,
+                with_bias=with_bias,
+                **extra_weight_attrs,
+            )
+            return
+        # BF16 checkpoint: create BF16 params; MXFP8 quant happens in
+        # process_weights_after_loading (inherited from UnquantizedFusedMoEMethod
+        # → NPUMXFP8MoEMethod).
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            with_bias=with_bias,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._fp8_checkpoint:
+            # Reinterpret [128,128] block-FP8 float32 scales as A5 MXFP8 e8m0
+            # scales (same technique as NPUMXFP8LinearMethod). Extract the 8-bit
+            # exponent from the float32 bits, expand from per-128 to per-32 (K)
+            # and replicate across 128 (N), producing uint8 [E, N, K//32]. Then
+            # rename weight_scale_inv → weight_scale so the inherited offline
+            # path in NPUMXFP8MoEMethod picks it up (reshape pairs + transpose).
+            block_n, block_k = self.quant_config.weight_block_size
+            for prefix in ("w13", "w2"):
+                scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
+                # [E, N//bn, K//bk] float32 → [E, N//bn, K//bk] uint8 exponent
+                scale_u8 = (
+                    scale_inv.data.view(torch.int32) >> 23 & 0xFF
+                ).to(torch.uint8)
+                # Expand K: 128→4×32, then N: replicate across 128 rows
+                scale_u8 = scale_u8.repeat_interleave(
+                    block_k // 32, dim=2
+                ).repeat_interleave(block_n, dim=1)
+                # [E, N, K//32] uint8 — same layout as offline ModelSlim scales
+                delattr(layer, f"{prefix}_weight_scale_inv")
+                layer.register_parameter(
+                    f"{prefix}_weight_scale",
+                    torch.nn.Parameter(scale_u8, requires_grad=False),
+                )
+        # Inherited path: NPUMXFP8MoEMethod.process_weights_after_loading
+        # sees float8_e4m3fn weight + uint8 weight_scale → offline layout path.
+        super().process_weights_after_loading(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
