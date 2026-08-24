@@ -191,7 +191,12 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
                 input_size_per_partition=input_size_per_partition,
                 output_partition_sizes=output_partition_sizes,
                 weight_loader=extra_weight_attrs.get("weight_loader"),
-                skip_block_quant_check=False,
+                # MiMo-V2 uses head_dim=192 / v_head_dim=128 which are not
+                # multiples of block_n=128; the model code sets
+                # skip_block_quant_check=True to bypass the alignment check.
+                skip_block_quant_check=extra_weight_attrs.pop(
+                    "skip_block_quant_check", False
+                ),
                 input_size=input_size,
                 output_size=output_size,
                 is_checkpoint_fp8_serialized=True,
