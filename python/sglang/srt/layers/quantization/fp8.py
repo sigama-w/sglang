@@ -312,7 +312,11 @@ class Fp8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> Fp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        use_mxfp8 = "mxfp8" in quant_method
+        requantization_method = config.get("requantization_method", "")
+        # use_mxfp8 is True when the checkpoint is native MXFP8 (quant_method
+        # contains "mxfp8") OR when the user requested --quantization mxfp8
+        # requantization of an FP8 checkpoint (requantization_method="mxfp8").
+        use_mxfp8 = "mxfp8" in quant_method or requantization_method == "mxfp8"
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         packed_modules_mapping = (
@@ -335,12 +339,17 @@ class Fp8Config(QuantizationConfig):
         )
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
-            if weight_block_size is not None and weight_block_size != [1, 32]:
-                logger.warning(
-                    "MXFP8 overriding weight_block_size=%s from config.json -> [1, 32].",
-                    weight_block_size,
-                )
-            weight_block_size = [1, 32]
+            # Exception: FP8→MXFP8 requantization preserves the original
+            # weight_block_size (e.g. [128, 128]) because the NPU A5 path
+            # reinterprets the float32 block scales as e8m0 (see
+            # _process_npu_a5_mxfp8_linear_weights).
+            if requantization_method != "mxfp8":
+                if weight_block_size is not None and weight_block_size != [1, 32]:
+                    logger.warning(
+                        "MXFP8 overriding weight_block_size=%s from config.json -> [1, 32].",
+                        weight_block_size,
+                    )
+                weight_block_size = [1, 32]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,

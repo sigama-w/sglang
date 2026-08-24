@@ -337,34 +337,6 @@ def get_quant_config(
         if model_config.quantization == "mxfp8":
             if not issubclass(quant_cls, Fp8Config):
                 quant_cls = Fp8Config
-            # Detect if the checkpoint is actually FP8 serialized (e.g.
-            # MiMo-V2.5-Pro has quant_method=fp8 with weight_block_size=[128,128]
-            # in config.json). In that case set is_checkpoint_fp8_serialized=True
-            # so the weight loader creates FP8 parameters and loads the block
-            # scales; the NPU MXFP8 method then dequantizes FP8→BF16 before
-            # requantizing to NPU-native MXFP8 in process_weights_after_loading.
-            # Preserve the original weight_block_size — Fp8Config.from_config
-            # would force [1, 32] which mismatches the [128, 128] checkpoint.
-            hf_quant_cfg = getattr(
-                model_config.hf_config, "quantization_config", None
-            ) or {}
-            ckpt_quant_method = (
-                hf_quant_cfg.get("quant_method", "") if hf_quant_cfg else ""
-            )
-            if (
-                isinstance(ckpt_quant_method, str)
-                and "fp8" in ckpt_quant_method.lower()
-            ):
-                ckpt_block_size = hf_quant_cfg.get("weight_block_size")
-                cfg = quant_cls(
-                    use_mxfp8=True,
-                    is_checkpoint_fp8_serialized=True,
-                    activation_scheme=hf_quant_cfg.get(
-                        "activation_scheme", "dynamic"
-                    ),
-                    weight_block_size=ckpt_block_size,
-                )
-                return cfg
             return quant_cls(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         if model_config.quantization == "quark_mxfp4":
             # Some ModelOpt NVFP4 checkpoints store quant metadata only in
