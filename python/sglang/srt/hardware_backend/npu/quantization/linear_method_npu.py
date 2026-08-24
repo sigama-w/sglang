@@ -176,6 +176,29 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # FP8 checkpoint (e.g. MiMo-V2.5-Pro): create float8_e4m3fn weight +
+        # float32 weight_scale_inv so the loader can populate them; dequant to
+        # BF16 happens in process_weights_after_loading before MXFP8 requant.
+        if getattr(self.quant_config, "is_checkpoint_fp8_serialized", False):
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+            Fp8LinearMethod.create_fp8_weight_(
+                layer,
+                block_quant=self.quant_config.weight_block_size is not None,
+                quant_config=self.quant_config,
+                use_mxfp8=False,  # standard FP8: float32 scales, not uint8 e8m0
+                output_size_per_partition=sum(output_partition_sizes),
+                input_size_per_partition=input_size_per_partition,
+                output_partition_sizes=output_partition_sizes,
+                weight_loader=extra_weight_attrs.get("weight_loader"),
+                skip_block_quant_check=False,
+                input_size=input_size,
+                output_size=output_size,
+                is_checkpoint_fp8_serialized=True,
+                params_dtype=params_dtype,
+            )
+            return
+
         from sglang.srt.layers.parameter import ModelWeightParameter
 
         output_size_per_partition = sum(output_partition_sizes)
@@ -199,9 +222,44 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
+    def _process_npu_a5_mxfp8_linear_weights(self, layer: torch.nn.Module) -> None:
+        """Reinterpret DeepSeek [128, 128] block-FP8 scales as A5 MXFP8 scales.
+
+        The checkpoint stores one fp32 scale per 128x128 block. The A5 GEMM
+        (``npu_w8a8_block_fp8_linear``) wants one E8M0 exponent byte per group
+        of ``MXFP8_BLOCK_SIZE`` elements, packed in pairs, with both weight and
+        scale K-major. So: pull the exponent field out of the fp32 bits, expand
+        it back over the block it covered, pair it up, and transpose.
+        """
+        scale_u8 = (
+            layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF
+        ).to(torch.uint8)
+        scale_u8 = scale_u8.repeat_interleave(4, dim=1).repeat_interleave(
+            128, dim=0
+        )
+        n_dim, k_dim = scale_u8.shape
+        layer.weight = Parameter(
+            layer.weight.data.transpose(0, 1), requires_grad=False
+        )
+        layer.weight_scale_inv = Parameter(
+            scale_u8.reshape(n_dim, k_dim // 2, 2).transpose(0, 1),
+            requires_grad=False,
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
-        if weight.dtype == torch.float8_e4m3fn:
+        # FP8 checkpoint with float32 [128,128] block scales → reinterpret
+        # the exponent field as A5 MXFP8 e8m0 scales (no dequantisation).
+        if (
+            weight.dtype == torch.float8_e4m3fn
+            and hasattr(layer, "weight_scale_inv")
+            and layer.weight_scale_inv.dtype == torch.float32
+        ):
+            self._process_npu_a5_mxfp8_linear_weights(layer)
+            # weight is now [in, out] float8_e4m3fn
+            # weight_scale_inv is now [in//64, out, 2] uint8 e8m0
+            # Same final layout as offline/online → skip to bias caching
+        elif weight.dtype == torch.float8_e4m3fn:
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
             # layer.weight_scale holds the uint8 block scales [out, in/32]. Only
             # re-layout to [in, out] / [in//64, out, 2] strided views below.

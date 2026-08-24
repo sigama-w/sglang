@@ -276,7 +276,14 @@ class Fp8Config(QuantizationConfig):
             if weight_block_size is None:
                 weight_block_size = [1, 32]
             elif weight_block_size != [1, 32]:
-                raise ValueError("MXFP8 requires weight_block_size=[1, 32].")
+                # NPU FP8→MXFP8 requantization path: checkpoint is standard FP8
+                # (e.g. [128, 128] block scales) and will be dequantized to
+                # BF16 then requantized to NPU-native MXFP8 at load time.
+                if not (is_npu() and is_checkpoint_fp8_serialized):
+                    raise ValueError(
+                        "MXFP8 requires weight_block_size=[1, 32], got "
+                        f"{weight_block_size}."
+                    )
         self.weight_block_size = weight_block_size
 
     def get_name(self) -> str:

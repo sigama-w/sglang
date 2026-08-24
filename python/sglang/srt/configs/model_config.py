@@ -237,7 +237,7 @@ def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
-REQUANTIZATION_METHODS = ["quark_mxfp4"]
+REQUANTIZATION_METHODS = ["quark_mxfp4", "mxfp8"]
 
 
 def get_num_indexer_layers(config) -> int:
