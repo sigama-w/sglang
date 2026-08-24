@@ -235,17 +235,29 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         of ``MXFP8_BLOCK_SIZE`` elements, packed in pairs, with both weight and
         scale K-major. So: pull the exponent field out of the fp32 bits, expand
         it back over the block it covered, pair it up, and transpose.
+
+        For QKV layers where output_partition_sizes are not multiples of
+        block_n (e.g. head_dim=192), the scale's N dimension is ceil-aligned
+        while the weight's N dimension is not. We must crop the expanded scale
+        to match the weight's actual N dimension after repeat_interleave.
         """
+        weight_data = layer.weight.data  # [out, in] float8_e4m3fn
+        out_dim, in_dim = weight_data.shape
+
         scale_u8 = (
             layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF
         ).to(torch.uint8)
-        scale_u8 = scale_u8.repeat_interleave(4, dim=1).repeat_interleave(
-            128, dim=0
+        # Expand K: block_k(128) -> 4 * MXFP8_BLOCK_SIZE(32)
+        scale_u8 = scale_u8.repeat_interleave(4, dim=1)
+        # Expand N: replicate each block_n(128) scale row 128 times
+        scale_u8 = scale_u8.repeat_interleave(128, dim=0)
+        # Crop to weight's actual N dimension (handles non-aligned QKV shards)
+        scale_u8 = scale_u8[:out_dim, :in_dim]
+
+        layer.weight = Parameter(
+            weight_data.transpose(0, 1), requires_grad=False
         )
         n_dim, k_dim = scale_u8.shape
-        layer.weight = Parameter(
-            layer.weight.data.transpose(0, 1), requires_grad=False
-        )
         layer.weight_scale_inv = Parameter(
             scale_u8.reshape(n_dim, k_dim // 2, 2).transpose(0, 1),
             requires_grad=False,
