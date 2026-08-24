@@ -1212,50 +1212,21 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 layer_id=host_layer_id,
                 page_size=self.page_size,
             )
-        elif io_backend == "kernel_ascend":
-            # NPU: transfer_kv_dim_exchange moves all layers at once, so only
-            # dispatch on layer 0. K and V buffers are passed independently,
-            # natively supporting head_dim != v_head_dim.
-            if self.layout != "page_first_direct":
-                raise ValueError(
-                    f"Unsupported layout for head_dim != v_head_dim "
-                    f"and io_backend='kernel_ascend': {self.layout}; expected "
-                    "'page_first_direct'."
-                )
-            if host_layer_id == 0:
-                transfer_kv_dim_exchange(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
-                    host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
-                    host_v=self.v_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.H2D,
-                )
         else:
             raise ValueError(
                 f"Unsupported IO backend for models with head_dim != v_head_dim: "
-                f"{io_backend}; expected 'kernel', 'direct', or 'kernel_ascend'."
+                f"{io_backend}; expected 'kernel' or 'direct'."
             )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        if io_backend == "kernel_ascend":
-            # NPU: skip CUDA-style ptr arrays; transfer_kv_dim_exchange reads
-            # device_pool.k_buffer/v_buffer directly.
-            device_k_data_ptrs = None
-            device_v_data_ptrs = None
-            device_k_buffers = None
-            device_v_buffers = None
-        else:
-            (
-                device_k_data_ptrs,
-                device_v_data_ptrs,
-                device_k_buffers,
-                device_v_buffers,
-            ) = self._resolve_device_transfer_buffers(device_pool)
+        (
+            device_k_data_ptrs,
+            device_v_data_ptrs,
+            device_k_buffers,
+            device_v_buffers,
+        ) = self._resolve_device_transfer_buffers(device_pool)
         if io_backend == "kernel":
             if self.layout != "page_first":
                 raise ValueError(
@@ -1319,29 +1290,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 dst_indices=host_indices,
                 page_size=self.page_size,
             )
-        elif io_backend == "kernel_ascend":
-            # NPU: K and V buffers are passed independently, natively
-            # supporting head_dim != v_head_dim.
-            if self.layout != "page_first_direct":
-                raise ValueError(
-                    f"Unsupported layout for head_dim != v_head_dim "
-                    f"and io_backend='kernel_ascend': {self.layout}; expected "
-                    "'page_first_direct'."
-                )
-            transfer_kv_dim_exchange(
-                device_indices=device_indices,
-                host_indices=host_indices,
-                device_k=device_pool.k_buffer,
-                host_k=self.k_buffer,
-                device_v=device_pool.v_buffer,
-                host_v=self.v_buffer,
-                page_size=self.page_size,
-                direction=TransferDirection.D2H,
-            )
         else:
             raise ValueError(
                 f"Unsupported IO backend for models with head_dim != v_head_dim: "
-                f"{io_backend}; expected 'kernel', 'direct', or 'kernel_ascend'."
+                f"{io_backend}; expected 'kernel' or 'direct'."
             )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
