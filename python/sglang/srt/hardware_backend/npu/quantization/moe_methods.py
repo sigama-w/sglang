@@ -243,8 +243,42 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
         e8m0_dtype = _require_e8m0_dtype()
 
+        # CAUSE-#3 DIAGNOSTIC: log incoming pertoken_scale to detect whether the
+        # w13->swiglu->w2 chain hands over a real e8m0 quant scale (uint8 / float8
+        # values in ~100..130) or something else (BF16, None, wrong shape).
+        # The kernel's elif branch assumes [tokens, K//64*2] -> [tokens, K//64, 2]
+        # of e8m0 bytes; if activation returns BF16 hidden_states + None scale,
+        # this reshape never runs and we silently fall through with stale scale.
+        if weight_prefix == "w2":
+            if pertoken_scale is None:
+                logger.warning_once(
+                    "NPUW4A8MXFP4 apply w2: pertoken_scale is None -> "
+                    "will self-quantize hidden_states via HiddenStatesDynamicQuant"
+                )
+            else:
+                ps_cpu = pertoken_scale.detach().to("cpu")
+                ps_flat = ps_cpu.float().flatten()
+                logger.warning_once(
+                    "NPUW4A8MXFP4 apply w2: pertoken_scale INCOMING "
+                    "dtype=%s shape=%s hs_dtype=%s hs_shape=%s "
+                    "min=%.4f max=%.4f sample=%s",
+                    pertoken_scale.dtype,
+                    tuple(pertoken_scale.shape),
+                    hidden_states.dtype,
+                    tuple(hidden_states.shape),
+                    float(ps_flat.min()) if ps_flat.numel() else float("nan"),
+                    float(ps_flat.max()) if ps_flat.numel() else float("nan"),
+                    tuple(ps_flat[:5].tolist()) if ps_flat.numel() else (),
+                )
+
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+            if weight_prefix == "w2":
+                logger.warning_once(
+                    "NPUW4A8MXFP4 apply w2: after self-quant, hs=%s pertoken_scale=%s",
+                    (hidden_states.dtype, tuple(hidden_states.shape)),
+                    (pertoken_scale.dtype, tuple(pertoken_scale.shape)),
+                )
         elif pertoken_scale is not None:
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 64, 2
