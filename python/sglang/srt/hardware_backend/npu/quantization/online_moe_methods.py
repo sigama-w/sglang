@@ -26,6 +26,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
     """Online MXFP8 FusedMoE entry point (``--quantization mxfp8`` on A5).
@@ -245,10 +249,45 @@ class NPUMXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
             # (same technique as NPUMXFP8's [128,128] scale path). If the
             # loader ever returns float8_e8m0fnu directly, a plain view works.
             scale = getattr(layer, f"{prefix}_weight_scale")
+            # Diagnostic: log scale dtype/shape/range to identify the checkpoint
+            # convention. Two valid encodings exist:
+            #   (a) float32 holding the e8m0 scale VALUE 2^(e-127) (power of 2,
+            #       e.g. 1.0/0.5/2.0). Bit-extraction of the IEEE-754 exponent
+            #       field recovers e.
+            #   (b) float32 holding the raw e8m0 BYTE as an integer 0..255
+            #       (uint8 storage cast to float32 by the loader). Direct
+            #       `.to(uint8)` recovers e; bit-extraction would corrupt it.
+            # If values are integers in [0, 255] we are in case (b); otherwise
+            # the bit-extraction path handles case (a) and float8_e8m0fnu.
             if scale.data.dtype == torch.float32:
-                scale_u8 = (
-                    scale.data.view(torch.int32) >> 23 & 0xFF
-                ).to(torch.uint8)
+                # Detect case (b): all values are non-negative integers in
+                # [0, 255]. cast uint8->float32 yields exact integers, while
+                # 2^(e-127) values are never integers except for e=127 (1.0).
+                s_flat = scale.data.detach().float().flatten()
+                is_int_like = bool(
+                    bool(torch.all(s_flat >= 0))
+                    and bool(torch.all(s_flat <= 255))
+                    and bool(torch.allclose(s_flat, s_flat.round()))
+                )
+                logger.warning_once(
+                    "NPUMXFP4OnlineMoEMethod %s_scale: dtype=%s shape=%s "
+                    "min=%.6f max=%.6f is_int_like=%s sample=%s",
+                    prefix,
+                    scale.data.dtype,
+                    tuple(scale.data.shape),
+                    float(s_flat.min()),
+                    float(s_flat.max()),
+                    is_int_like,
+                    s_flat[:5].to("cpu").tolist(),
+                )
+                if is_int_like:
+                    # Case (b): raw e8m0 byte stored as float32 integer.
+                    scale_u8 = scale.data.to(torch.uint8)
+                else:
+                    # Case (a): float32 holding 2^(e-127); extract exponent.
+                    scale_u8 = (
+                        scale.data.view(torch.int32) >> 23 & 0xFF
+                    ).to(torch.uint8)
             elif scale.data.dtype == torch.float8_e8m0fnu:
                 scale_u8 = scale.data.view(torch.uint8).clone()
             else:
