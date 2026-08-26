@@ -249,19 +249,21 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         # The kernel's elif branch assumes [tokens, K//64*2] -> [tokens, K//64, 2]
         # of e8m0 bytes; if activation returns BF16 hidden_states + None scale,
         # this reshape never runs and we silently fall through with stale scale.
-        if weight_prefix == "w2":
+        if weight_prefix in ("w13", "w2"):
             if pertoken_scale is None:
                 logger.warning_once(
-                    "NPUW4A8MXFP4 apply w2: pertoken_scale is None -> "
-                    "will self-quantize hidden_states via HiddenStatesDynamicQuant"
+                    "NPUW4A8MXFP4 apply %s: pertoken_scale is None -> "
+                    "will self-quantize hidden_states via HiddenStatesDynamicQuant",
+                    weight_prefix,
                 )
             else:
                 ps_cpu = pertoken_scale.detach().to("cpu")
                 ps_flat = ps_cpu.float().flatten()
                 logger.warning_once(
-                    "NPUW4A8MXFP4 apply w2: pertoken_scale INCOMING "
+                    "NPUW4A8MXFP4 apply %s: pertoken_scale INCOMING "
                     "dtype=%s shape=%s hs_dtype=%s hs_shape=%s "
                     "min=%.4f max=%.4f sample=%s",
+                    weight_prefix,
                     pertoken_scale.dtype,
                     tuple(pertoken_scale.shape),
                     hidden_states.dtype,
@@ -273,16 +275,28 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
 
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-            if weight_prefix == "w2":
+            if weight_prefix in ("w13", "w2"):
                 logger.warning_once(
-                    "NPUW4A8MXFP4 apply w2: after self-quant, hs=%s pertoken_scale=%s",
+                    "NPUW4A8MXFP4 apply %s: after self-quant, hs=%s pertoken_scale=%s",
+                    weight_prefix,
                     (hidden_states.dtype, tuple(hidden_states.shape)),
                     (pertoken_scale.dtype, tuple(pertoken_scale.shape)),
                 )
         elif pertoken_scale is not None:
+            old_shape = tuple(pertoken_scale.shape)
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 64, 2
             )
+            if weight_prefix in ("w13", "w2"):
+                logger.warning_once(
+                    "NPUW4A8MXFP4 apply %s: pertoken_scale RESHAPED "
+                    "%s -> %s (hs_shape=%s, expected K//64=%d)",
+                    weight_prefix,
+                    old_shape,
+                    tuple(pertoken_scale.shape),
+                    tuple(hidden_states.shape),
+                    hidden_states.shape[1] // 64,
+                )
 
         return self.matmul.forward(
             quant_info,
