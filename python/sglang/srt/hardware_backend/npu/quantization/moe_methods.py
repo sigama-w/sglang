@@ -225,6 +225,41 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         ).transpose(-1, -2)
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
+        _lid = getattr(self, "_layer_id", None)
+        _layer_ok = (not _MOE_DEBUG_LAYERS) or (_lid in _MOE_DEBUG_LAYERS)
+        if _MOE_DEBUG and _layer_ok:
+            try:
+                w_view = weight.data.detach().view(torch.uint8)
+                ws_pre = weight_scale.data.detach()
+                ws_pre_view = (
+                    ws_pre.view(torch.uint8)
+                    if ws_pre.dtype in (torch.int8, torch.uint8)
+                    else ws_pre.float()
+                )
+                # Find positions of outlier scale bytes (>=125) to see how
+                # reshape moves them relative to weight blocks.
+                ws_flat = ws_pre_view.flatten()
+                outlier_pos = (
+                    torch.nonzero(ws_flat >= 125).flatten()[:16].cpu().tolist()
+                )
+                logger.warning(
+                    "RESHAPE_DEBUG L%s %s PRE weight_shape=%s ws_shape=%s "
+                    "ws_dtype=%s ws_min=%d ws_max=%d ws_sample=%s "
+                    "outlier_ge125_pos=%s outlier_vals=%s",
+                    _lid, weight_prefix,
+                    tuple(weight.data.shape),
+                    tuple(weight_scale.data.shape),
+                    weight_scale.data.dtype,
+                    int(ws_flat.min()),
+                    int(ws_flat.max()),
+                    tuple(ws_flat[:16].cpu().tolist()),
+                    outlier_pos,
+                    tuple(ws_flat[outlier_pos].cpu().tolist()) if outlier_pos else (),
+                )
+            except Exception as e:
+                logger.warning("RESHAPE_DEBUG L%s %s PRE failed: %s",
+                              _lid, weight_prefix, e)
+
         scale = weight_scale.data.reshape(
             weight_scale.shape[0],
             weight_scale.shape[1],
@@ -232,6 +267,34 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             2,
         ).transpose(1, 2)
         weight_scale.data = scale
+
+        if _MOE_DEBUG and _layer_ok:
+            try:
+                ws_post = scale.detach()
+                ws_post_view = (
+                    ws_post.view(torch.uint8)
+                    if ws_post.dtype in (torch.int8, torch.uint8)
+                    else ws_post.float()
+                )
+                ws_flat_post = ws_post_view.flatten()
+                outlier_pos_post = (
+                    torch.nonzero(ws_flat_post >= 125).flatten()[:16].cpu().tolist()
+                )
+                logger.warning(
+                    "RESHAPE_DEBUG L%s %s POST ws_shape=%s ws_min=%d ws_max=%d "
+                    "ws_sample=%s outlier_ge125_pos=%s outlier_vals=%s",
+                    _lid, weight_prefix,
+                    tuple(ws_post.shape),
+                    int(ws_flat_post.min()),
+                    int(ws_flat_post.max()),
+                    tuple(ws_flat_post[:16].cpu().tolist()),
+                    outlier_pos_post,
+                    tuple(ws_flat_post[outlier_pos_post].cpu().tolist())
+                    if outlier_pos_post else (),
+                )
+            except Exception as e:
+                logger.warning("RESHAPE_DEBUG L%s %s POST failed: %s",
+                              _lid, weight_prefix, e)
 
         # The refactored Ascend dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
