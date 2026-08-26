@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -17,6 +18,15 @@ import logging
 from sglang.srt.hardware_backend.npu.moe.matmul import (
     GroupedMatmul,
     GroupedMatmulSwigluQuant,
+)
+
+# Diagnostic switch: set SGLANG_MOE_DEBUG=1 to dump per-apply antiquant_scale
+# status and I/O norms. Used to locate the layer where hidden_states explode.
+_MOE_DEBUG = os.environ.get("SGLANG_MOE_DEBUG", "0") == "1"
+# Optional layer allowlist, e.g. SGLANG_MOE_DEBUG_LAYERS=20,21,22,23 restricts
+# diagnostics to those layers only. Empty = print for all layers (when _MOE_DEBUG).
+_MOE_DEBUG_LAYERS = frozenset(
+    int(x) for x in os.environ.get("SGLANG_MOE_DEBUG_LAYERS", "").split(",") if x.strip()
 )
 from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
@@ -298,7 +308,46 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
                     hidden_states.shape[1] // 64,
                 )
 
-        return self.matmul.forward(
+        # CAUSE-#3 DIAGNOSTIC: dump antiquant_scale status + I/O norms to
+        # locate the layer where hidden_states explode. Enable with
+        # SGLANG_MOE_DEBUG=1; optionally restrict to specific layers via
+        # SGLANG_MOE_DEBUG_LAYERS=20,21,22,23.
+        ws_param = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        _lid = getattr(self, "_layer_id", None)
+        _layer_ok = (not _MOE_DEBUG_LAYERS) or (_lid in _MOE_DEBUG_LAYERS)
+        if _MOE_DEBUG and _layer_ok:
+            try:
+                in_norm = float(hidden_states.detach().float().norm().item())
+                in_shape = tuple(hidden_states.shape)
+                if ws_param is None:
+                    logger.warning(
+                        "MOE_DEBUG L%s w4a8 %s antiquant_scale=None "
+                        "hs_norm=%.4f shape=%s",
+                        _lid, weight_prefix, in_norm, in_shape,
+                    )
+                else:
+                    ws_view = (
+                        ws_param.detach().view(torch.uint8)
+                        if ws_param.dtype in (torch.int8, torch.uint8)
+                        else ws_param.detach().float()
+                    )
+                    logger.warning(
+                        "MOE_DEBUG L%s w4a8 %s ws_dtype=%s ws_shape=%s "
+                        "ws_min=%d ws_max=%d ws_sample=%s "
+                        "hs_norm=%.4f shape=%s",
+                        _lid, weight_prefix,
+                        ws_param.dtype,
+                        tuple(ws_param.shape),
+                        int(ws_view.min()),
+                        int(ws_view.max()),
+                        tuple(ws_view.flatten()[:8].cpu().tolist()),
+                        in_norm, in_shape,
+                    )
+            except Exception as e:
+                logger.warning("MOE_DEBUG L%s w4a8 %s diag failed: %s",
+                              _lid, weight_prefix, e)
+
+        output = self.matmul.forward(
             quant_info,
             weight_prefix,
             hidden_states,
@@ -309,13 +358,24 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             scale=None,
             scale_dtype=None,
             per_token_scale=[pertoken_scale],
-            antiquant_scale=[
-                getattr(quant_info, f"{weight_prefix}_weight_scale", None)
-            ],
+            antiquant_scale=[ws_param],
             x_dtype=torch.float8_e4m3fn,
             weight_dtype=fp4_dtype,
             per_token_scale_dtype=e8m0_dtype,
         )
+
+        if _MOE_DEBUG and _layer_ok:
+            try:
+                out_norm = float(output.detach().float().norm().item())
+                logger.warning(
+                    "MOE_DEBUG L%s w4a8 %s out_norm=%.4f dtype=%s",
+                    _lid, weight_prefix, out_norm, output.dtype,
+                )
+            except Exception as e:
+                logger.warning("MOE_DEBUG L%s w4a8 %s out diag failed: %s",
+                              _lid, weight_prefix, e)
+
+        return output
 
 
 # ---------------------------------------------------------------------------

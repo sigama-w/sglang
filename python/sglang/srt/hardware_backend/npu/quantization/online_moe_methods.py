@@ -231,6 +231,12 @@ class NPUMXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
         # reads layer.w2_kernel to pick its activation path.
         layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
         layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
+        # Tag kernels with layer_id so apply() can filter diagnostics by layer
+        # (env SGLANG_MOE_DEBUG_LAYERS=20,21,22,23). Fallback to None if the
+        # FusedMoE instance doesn't expose layer_id.
+        _lid = getattr(layer, "layer_id", None)
+        layer.w13_kernel._layer_id = _lid
+        layer.w2_kernel._layer_id = _lid
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
