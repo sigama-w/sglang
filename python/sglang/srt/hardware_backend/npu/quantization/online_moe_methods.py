@@ -278,7 +278,7 @@ class NPUMXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
                     float(s_flat.min()),
                     float(s_flat.max()),
                     is_int_like,
-                    s_flat[:5].to("cpu").tolist(),
+                    tuple(s_flat[:5].to("cpu").tolist()),
                 )
                 if is_int_like:
                     # Case (b): raw e8m0 byte stored as float32 integer.
