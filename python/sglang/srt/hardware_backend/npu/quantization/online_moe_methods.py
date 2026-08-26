@@ -202,6 +202,18 @@ class NPUMXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
             **extra_weight_attrs,
         )
 
+        # MiMo's expert loader (mimo_v2.load_weights via
+        # DeepEPMoE.make_expert_params_mapping) maps the HF checkpoint tensor
+        # ...experts.{id}.down_proj.weight_scale to a param named
+        # {prefix}_weight_scale (no "_inv"), whereas the fp8 FP4 helper
+        # registers {prefix}_weight_scale_inv (DSV4 convention). Re-register
+        # under the loader-expected name, reusing the same Parameter object so
+        # its weight_loader / shard attrs survive.
+        for prefix in ("w13", "w2"):
+            inv_param = getattr(layer, f"{prefix}_weight_scale_inv")
+            delattr(layer, f"{prefix}_weight_scale_inv")
+            layer.register_parameter(f"{prefix}_weight_scale", inv_param)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
@@ -232,20 +244,16 @@ class NPUMXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
             # its 8-bit exponent to get the uint8 e8m0 byte the kernel consumes
             # (same technique as NPUMXFP8's [128,128] scale path). If the
             # loader ever returns float8_e8m0fnu directly, a plain view works.
-            scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
-            if scale_inv.data.dtype == torch.float32:
+            scale = getattr(layer, f"{prefix}_weight_scale")
+            if scale.data.dtype == torch.float32:
                 scale_u8 = (
-                    scale_inv.data.view(torch.int32) >> 23 & 0xFF
+                    scale.data.view(torch.int32) >> 23 & 0xFF
                 ).to(torch.uint8)
-            elif scale_inv.data.dtype == torch.float8_e8m0fnu:
-                scale_u8 = scale_inv.data.view(torch.uint8).clone()
+            elif scale.data.dtype == torch.float8_e8m0fnu:
+                scale_u8 = scale.data.view(torch.uint8).clone()
             else:
-                scale_u8 = scale_inv.data.to(torch.uint8)
-            delattr(layer, f"{prefix}_weight_scale_inv")
-            layer.register_parameter(
-                f"{prefix}_weight_scale",
-                torch.nn.Parameter(scale_u8, requires_grad=False),
-            )
+                scale_u8 = scale.data.to(torch.uint8)
+            scale.data = scale_u8
 
             # NPU offline layout: npu_format_cast(weight) + transpose + scale
             # reshape + dispatcher dtype. The kernel reads {prefix}_weight and
