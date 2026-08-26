@@ -241,20 +241,17 @@ class NPUMXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
             # Packed MXFP4 weight is int8 (2 fp4 per byte); the NPU W4A8 kernel
             # expects uint8. Identical byte layout -> zero-copy bitcast.
             weight = getattr(layer, f"{prefix}_weight")
-            # Diagnostic: log weight byte distribution before bitcast
-            w_int8 = weight.data.detach().view(torch.uint8).flatten()
-            w_unique = torch.unique(w_int8)
+            # Diagnostic: lightweight weight stats (avoid OOM from torch.unique)
+            w_view = weight.data.detach().view(torch.uint8)
             logger.warning_once(
                 "NPUMXFP4OnlineMoEMethod %s_weight: dtype=%s shape=%s "
-                "num_unique_bytes=%d byte_min=%d byte_max=%d "
-                "sample_bytes=%s",
+                "byte_min=%d byte_max=%d sample_bytes=%s",
                 prefix,
                 weight.data.dtype,
                 tuple(weight.data.shape),
-                int(w_unique.numel()),
-                int(w_int8.min()),
-                int(w_int8.max()),
-                tuple(w_int8[:8].to("cpu").tolist()),
+                int(w_view.min()),
+                int(w_view.max()),
+                tuple(w_view.flatten()[:8].to("cpu").tolist()),
             )
             weight.data = weight.data.contiguous().view(torch.uint8)
 

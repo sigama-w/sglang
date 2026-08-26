@@ -244,9 +244,34 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         weight_data = layer.weight.data  # [out, in] float8_e4m3fn
         out_dim, in_dim = weight_data.shape
 
-        scale_u8 = (
-            layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF
-        ).to(torch.uint8)
+        scale_data = layer.weight_scale_inv.data
+        if scale_data.dtype == torch.float32:
+            s_flat = scale_data.detach().float().flatten()
+            is_int_like = bool(
+                bool(torch.all(s_flat >= 0))
+                and bool(torch.all(s_flat <= 255))
+                and bool(torch.allclose(s_flat, s_flat.round()))
+            )
+            logger.warning_once(
+                "NPUMXFP8Linear weight_scale_inv: dtype=%s shape=%s "
+                "min=%.6f max=%.6f is_int_like=%s sample=%s",
+                scale_data.dtype,
+                tuple(scale_data.shape),
+                float(s_flat.min()),
+                float(s_flat.max()),
+                is_int_like,
+                tuple(s_flat[:5].to("cpu").tolist()),
+            )
+            if is_int_like:
+                scale_u8 = scale_data.to(torch.uint8)
+            else:
+                scale_u8 = (
+                    scale_data.view(torch.int32) >> 23 & 0xFF
+                ).to(torch.uint8)
+        else:
+            scale_u8 = (
+                scale_data.view(torch.int32) >> 23 & 0xFF
+            ).to(torch.uint8)
         # Expand K: block_k(128) -> 4 * MXFP8_BLOCK_SIZE(32)
         scale_u8 = scale_u8.repeat_interleave(4, dim=1)
         # Expand N: replicate each block_n(128) scale row 128 times
