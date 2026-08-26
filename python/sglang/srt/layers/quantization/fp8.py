@@ -372,7 +372,12 @@ class Fp8Config(QuantizationConfig):
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
                 return UnquantizedLinearMethod()
-            if is_npu() and self.use_mxfp8:
+            if is_npu() and (self.use_mxfp8 or self.is_checkpoint_fp8_serialized):
+                # On Ascend, any FP8-serialized checkpoint (plain FP8 or MXFP8)
+                # is dequantized to BF16 and requantized to NPU-native MXFP8 at
+                # load. This also covers the FP8 non-expert linears of an MXFP4
+                # MoE checkpoint (e.g. MiMo-V2.5-Pro-FP4-DFlash) whose experts
+                # are routed to NPUMXFP4OnlineMoEMethod below.
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     NPUMXFP8LinearMethod,
                 )
@@ -393,6 +398,16 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUMXFP8OnlineMoEMethod(self)
+
+            if is_npu() and self.is_fp4_experts:
+                # Pre-packed MXFP4 experts (store_dtype="mxfp4", e.g. MiMo-V2.5
+                # -Pro-FP4-DFlash). Reuse the fp8 FP4 weight creation/loader to
+                # read the HF mxfp4 checkpoint, then run the NPU W4A8 kernel.
+                from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
+                    NPUMXFP4OnlineMoEMethod,
+                )
+
+                return NPUMXFP4OnlineMoEMethod(self)
 
             fp8_method = Fp8MoEMethod(self)
 

@@ -421,6 +421,26 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
+        # Non-DSV4 MXFP4 MoE experts (e.g. Xiaomi MiMo-V2.5-Pro-FP4-DFlash):
+        # the checkpoint declares quant_method="fp8" but stores routed-expert
+        # weights as packed MXFP4 (quant config field store_dtype="mxfp4").
+        # Unlike DSV4 there is no env override; detection is driven purely by
+        # the quant config field so the fp8 quant path routes experts to the
+        # NPU W4A8 kernel instead of treating them as plain e4m3 FP8.
+        if not self.is_fp4_experts:
+            _mxfp4_quant_cfg = getattr(self.hf_config, "quantization_config", None)
+            if _mxfp4_quant_cfg is not None and not isinstance(
+                _mxfp4_quant_cfg, dict
+            ):
+                _mxfp4_quant_cfg = _mxfp4_quant_cfg.to_dict()
+            _store_dtype = (_mxfp4_quant_cfg or {}).get("store_dtype")
+            if _store_dtype == "mxfp4":
+                self.is_fp4_experts = True
+                logger.info(
+                    "Detected MXFP4 expert weights (store_dtype=mxfp4): "
+                    "is_fp4_experts=True."
+                )
+
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
         hybrid_quant_cfg = getattr(self.hf_config, "quantization_config", None)

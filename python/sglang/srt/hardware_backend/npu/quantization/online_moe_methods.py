@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoEMethod
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP8MoEMethod,
+    NPUW4A8MXFP4MoEMethod,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -144,3 +147,109 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
         # Inherited apply() consults this; aiter is CUDA/ROCm-only.
         self._aiter_runner = None
+
+
+class NPUMXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
+    """Online MXFP4 (W4A8) FusedMoE entry for pre-packed MXFP4 checkpoints.
+
+    Covers checkpoints that declare ``quant_method="fp8"`` with
+    ``store_dtype="mxfp4"`` (e.g. Xiaomi MiMo-V2.5-Pro-FP4-DFlash): routed
+    experts are stored as packed MXFP4 (2 fp4 per byte) with per-32 e8m0 block
+    scales, while the non-expert linears stay FP8 (routed to
+    ``NPUMXFP8LinearMethod``).
+
+    Weight creation reuses ``Fp8MoEMethod.create_fp8_moe_weight_`` so the
+    existing fp8 FP4 weight loader reads the HF mxfp4 checkpoint unchanged
+    (same layout as the DSV4 mxfp4 path). ``process_weights_after_loading``
+    then bitcasts the int8 packed weight to uint8, reinterprets the float32
+    e8m0 scales as uint8, and delegates to ``NPUW4A8MXFP4MoEMethod`` for the
+    Ascend layout (``npu_format_cast`` + transpose + scale reshape). The
+    forward pass is the kernel's own ``apply`` (grouped matmul, fp4 weight +
+    e8m0 scale, dynamic MXFP8 activation), invoked by the Ascend runner via
+    ``layer.w13_kernel``/``layer.w2_kernel``.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        quant_config = self.quant_config
+        block_quant = quant_config.weight_block_size is not None
+        Fp8MoEMethod.create_fp8_moe_weight_(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            block_quant=block_quant,
+            quant_config=quant_config,
+            use_mxfp8=False,
+            is_checkpoint_fp8_serialized=True,
+            is_fp4_expert=True,
+            params_dtype=params_dtype,
+            with_bias=with_bias,
+            **extra_weight_attrs,
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        backend = get_moe_runner_backend()
+        if not (backend.is_auto() or backend.is_ascend()):
+            raise ValueError(
+                "MXFP4 MoE on Ascend requires --moe-runner-backend 'auto' or "
+                f"'ascend', got {backend.value!r}."
+            )
+        # Attach kernels before building the runner: AscendRunnerCore.__init__
+        # reads layer.w2_kernel to pick its activation path.
+        layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
+        layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        self._aiter_runner = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        for prefix in ("w13", "w2"):
+            # Packed MXFP4 weight is int8 (2 fp4 per byte); the NPU W4A8 kernel
+            # expects uint8. Identical byte layout -> zero-copy bitcast.
+            weight = getattr(layer, f"{prefix}_weight")
+            weight.data = weight.data.contiguous().view(torch.uint8)
+
+            # create_fp8_moe_weight_ allocates per-32 scales as float32 on
+            # non-aiter (NPU). Each float32 holds an e8m0 scale value; extract
+            # its 8-bit exponent to get the uint8 e8m0 byte the kernel consumes
+            # (same technique as NPUMXFP8's [128,128] scale path). If the
+            # loader ever returns float8_e8m0fnu directly, a plain view works.
+            scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
+            if scale_inv.data.dtype == torch.float32:
+                scale_u8 = (
+                    scale_inv.data.view(torch.int32) >> 23 & 0xFF
+                ).to(torch.uint8)
+            elif scale_inv.data.dtype == torch.float8_e8m0fnu:
+                scale_u8 = scale_inv.data.view(torch.uint8).clone()
+            else:
+                scale_u8 = scale_inv.data.to(torch.uint8)
+            delattr(layer, f"{prefix}_weight_scale_inv")
+            layer.register_parameter(
+                f"{prefix}_weight_scale",
+                torch.nn.Parameter(scale_u8, requires_grad=False),
+            )
+
+            # NPU offline layout: npu_format_cast(weight) + transpose + scale
+            # reshape + dispatcher dtype. The kernel reads {prefix}_weight and
+            # {prefix}_weight_scale off the layer.
+            getattr(layer, f"{prefix}_kernel").process_weights_after_loading(
+                layer, prefix
+            )
