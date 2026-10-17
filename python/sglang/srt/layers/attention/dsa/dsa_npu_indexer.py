@@ -5,7 +5,6 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -313,29 +312,14 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
-            block_table = block_table[: actual_seq_lengths_q[0].numel()]
-            topk_indices = self.do_npu_cp_balance_indexer(
+            topk_indices = self.do_npu_cp_per_token_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
                 weights,
                 positions,
-                actual_seq_lengths_q,
-                actual_seq_lengths_kv,
+                forward_batch,
                 block_table,
             )
-            if isinstance(
-                forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
-            ):
-                # The half-split kernel calls carry a single per-half kv bound,
-                # which is only exact when local rows are contiguous (zigzag).
-                # Interleave rows sit cp_size apart, so the half bound lets the
-                # indexer select candidates past each row's own causal end and
-                # the sparse-attention kernel (whose aligned-causal bound is
-                # likewise permissive) would attend to future tokens. Clamp the
-                # selected indices to the row's absolute position; CUDA avoids
-                # this with per-token ks/ke bounds instead.
-                limit = positions.to(topk_indices.dtype).view(-1, 1)
-                topk_indices = torch.minimum(topk_indices, limit)
             return topk_indices
         else:
             block_table = (
@@ -387,96 +371,75 @@ class DSANPUIndexerMixin:
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices[0].squeeze(1)
 
-    def do_npu_cp_balance_indexer(
+    def do_npu_cp_per_token_indexer(
         self,
         q,
         past_key_states,
         indexer_weights,
         positions,
-        actual_seq_lengths_q,
-        actual_seq_lengths_kv,
+        forward_batch,
         block_table,
     ):
-        actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
-        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
-        # The local q tensor carries physical padding rows appended by
-        # pad_local_rows, while the declared TND counts are logical. Slice both
-        # halves down to their logical rows first (logical rows are a prefix of
-        # the physical layout); otherwise the rows straddling the physical
-        # midpoint fall outside the declared counts and are silently dropped by
-        # the kernel, corrupting those tokens' top-k at every layer.
-        prev_total = int(actual_seq_lengths_q_prev[-1])
-        next_total = int(actual_seq_lengths_q_next[-1])
-        q_prev = q[:prev_total]
-        q_next = q[prev_total : prev_total + next_total]
-        # A short request can leave a rank with fewer logical rows than the
-        # half split, producing an empty half; the kernel rejects empty query
-        # tensors, so skip that call and leave the half zeroed.
-        topk_prev = None
-        topk_next = None
-        if prev_total > 0:
-            weights_prev = None
-            if indexer_weights is not None:
-                weights_prev = indexer_weights[:prev_total].contiguous().view(
-                    -1, indexer_weights.shape[-1]
-                )
-            topk_indices_prev = torch_npu.npu_lightning_indexer(
-                query=q_prev,
-                key=past_key_states,
-                weights=weights_prev,
-                actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
+        """Per-token pseudo-batch indexer call for prefill CP.
+
+        ``npu_lightning_indexer`` only accepts one kv bound per TND batch, and
+        its aligned-causal arithmetic reproduces the true causal bound of every
+        query row only when local rows are contiguous (zigzag chunks). Under
+        interleave CP the rows sit ``cp_size`` apart, so a shared bound either
+        leaks future candidates or needs post-hoc masking. Instead, give every
+        logical row its own single-query batch — the kv bound is the row's own
+        causal end, the TND boundaries are ``1..T``, and each request's block
+        table row is replicated per its local row count. This mirrors the CUDA
+        per-token ``ks/ke`` bounds (``DsaBackendMetadata.split_per_token``) and
+        reuses the same kernel configuration as the NPU decode path
+        (``layout_query="TND"`` with one query per batch).
+        """
+        meta = forward_batch.attn_cp_metadata
+        per_request_rows = (
+            meta.actual_seq_q_prev_tensor + meta.actual_seq_q_next_tensor
+        ).to(torch.int64)
+        total = int(per_request_rows.sum())
+        block_table = block_table[: per_request_rows.numel()].repeat_interleave(
+            per_request_rows, dim=0
+        )
+        num_rows = q.size(0)
+        q = q[:total]
+        if indexer_weights is not None:
+            indexer_weights = indexer_weights[:total].contiguous().view(
+                -1, indexer_weights.shape[-1]
             )
-            topk_prev = topk_indices_prev[0].squeeze(1)
-        if next_total > 0:
-            weights_next = None
-            if indexer_weights is not None:
-                weights_next = indexer_weights[
-                    prev_total : prev_total + next_total
-                ].contiguous().view(-1, indexer_weights.shape[-1])
-            topk_indices_next = torch_npu.npu_lightning_indexer(
-                query=q_next,
-                key=past_key_states,
-                weights=weights_next,
-                actual_seq_lengths_query=actual_seq_lengths_q_next.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
-                    device=q.device, dtype=torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )
-            topk_next = topk_indices_next[0].squeeze(1)
-        if topk_prev is None and topk_next is None:
+        if total == 0:
             # Every local row is padding; nothing is consumed downstream.
             return torch.zeros(
-                (q.size(0), self.index_topk),
+                (num_rows, self.index_topk),
                 dtype=torch.int32,
                 device=q.device,
             )
-        # Restore the physical row layout: logical results back to their
-        # original offsets, padding rows zeroed so downstream slicing by row
-        # index stays aligned.
-        ref = topk_prev if topk_prev is not None else topk_next
-        topk_indices = ref.new_zeros((q.size(0), ref.shape[-1]))
-        if topk_prev is not None:
-            topk_indices[:prev_total] = topk_prev[:prev_total]
-        if topk_next is not None:
-            topk_indices[prev_total : prev_total + next_total] = topk_next[:next_total]
-        return topk_indices
+        # Absolute causal end of each row: prefix-aware positions already
+        # include the prefix offset, so the bound is positions + 1.
+        kv_bound = (positions[:total] + 1).to(torch.int32)
+        seq_q = torch.arange(
+            1, total + 1, dtype=torch.int32, device=q.device
+        )
+        topk_indices = torch_npu.npu_lightning_indexer(
+            query=q,
+            key=past_key_states,
+            weights=indexer_weights,
+            actual_seq_lengths_query=seq_q,
+            actual_seq_lengths_key=kv_bound,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+        )
+        topk_indices = topk_indices[0].squeeze(1)
+        # Restore the physical row layout; padding rows are never consumed by
+        # the sparse-attention half-split, which slices the same logical
+        # prefix.
+        full = topk_indices.new_zeros((num_rows, topk_indices.shape[-1]))
+        full[:total] = topk_indices
+        return full
 
 
 def scattered_to_tp_attn_full(
