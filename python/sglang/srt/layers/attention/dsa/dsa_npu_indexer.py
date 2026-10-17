@@ -248,13 +248,22 @@ class DSANPUIndexerMixin:
                     ),
                 )
                 if sum(forward_batch.extend_prefix_lens_cpu) > 0:
+                    # The metadata kv-len counts live on CPU while
+                    # extend_prefix_lens is an NPU tensor; align devices
+                    # before the arithmetic (this branch only triggers once
+                    # radix prefix hits appear, i.e. under batched load).
+                    prefix_lens = forward_batch.extend_prefix_lens
                     total_kv_len_prev_tensor = (
-                        forward_batch.attn_cp_metadata.kv_len_prev_tensor
-                        + forward_batch.extend_prefix_lens.squeeze()
+                        forward_batch.attn_cp_metadata.kv_len_prev_tensor.to(
+                            prefix_lens.device
+                        )
+                        + prefix_lens.squeeze()
                     )
                     total_kv_len_next_tensor = (
-                        forward_batch.attn_cp_metadata.kv_len_next_tensor
-                        + forward_batch.extend_prefix_lens.squeeze()
+                        forward_batch.attn_cp_metadata.kv_len_next_tensor.to(
+                            prefix_lens.device
+                        )
+                        + prefix_lens.squeeze()
                     )
                     get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
                         total_kv_len_prev_tensor,
