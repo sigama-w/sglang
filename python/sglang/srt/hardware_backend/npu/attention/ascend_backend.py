@@ -1201,20 +1201,23 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         seq_len = q_nope.shape[0]
-        split_len = (seq_len + 1) // 2
-        q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
-        q_rope_prev, q_rope_next = torch.split(q_pe, split_len, dim=0)
-        q_nope_prev = q_nope_prev.contiguous()
-        q_nope_next = q_nope_next.contiguous()
-        q_rope_prev = q_rope_prev.contiguous()
-        q_rope_next = q_rope_next.contiguous()
-        topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        topk_indices_prev, topk_indices_next = torch.split(
-            topk_indices, split_len, dim=0
-        )
-
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+        # The q tensors carry physical padding rows while the declared TND
+        # counts are logical. Slice each half down to its logical rows (a
+        # prefix of the physical layout) before the kernel calls, then place
+        # the results back into a full physical-shaped buffer; the rows
+        # straddling the physical midpoint would otherwise fall outside the
+        # declared counts and be dropped by the kernel.
+        prev_total = int(actual_seq_qlen_prev[-1])
+        next_total = int(actual_seq_qlen_next[-1])
+        q_nope_prev = q_nope[:prev_total].contiguous()
+        q_nope_next = q_nope[prev_total : prev_total + next_total].contiguous()
+        q_rope_prev = q_pe[:prev_total].contiguous()
+        q_rope_next = q_pe[prev_total : prev_total + next_total].contiguous()
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        topk_indices_prev = topk_indices[:prev_total]
+        topk_indices_next = topk_indices[prev_total : prev_total + next_total]
 
         attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope_prev,
@@ -1260,7 +1263,10 @@ class AscendAttnBackend(AttentionBackend):
             attention_mode=2,
             return_softmax_lse=False,
         )
-        return torch.cat([attn_out_prev, attn_out_next], dim=0)
+        attn_out = torch.zeros_like(q_nope).to(attn_out_prev.dtype)
+        attn_out[:prev_total] = attn_out_prev[:prev_total]
+        attn_out[prev_total : prev_total + next_total] = attn_out_next[:next_total]
+        return attn_out
 
     def do_cp_attn_fia(
         self,

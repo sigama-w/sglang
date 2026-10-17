@@ -397,17 +397,26 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_kv,
         block_table,
     ):
-        q_prev, q_next = torch.split(q, (q.size(0) + 1) // 2, dim=0)
-        weights_prev, weights_next = None, None
-        if indexer_weights is not None:
-            weights_prev, weights_next = torch.split(
-                indexer_weights, (indexer_weights.size(0) + 1) // 2, dim=0
-            )
-            weights_prev = weights_prev.contiguous().view(-1, weights_prev.shape[-1])
-            weights_next = weights_next.contiguous().view(-1, weights_next.shape[-1])
-
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+        # The local q tensor carries physical padding rows appended by
+        # pad_local_rows, while the declared TND counts are logical. Slice both
+        # halves down to their logical rows first (logical rows are a prefix of
+        # the physical layout); otherwise the rows straddling the physical
+        # midpoint fall outside the declared counts and are silently dropped by
+        # the kernel, corrupting those tokens' top-k at every layer.
+        prev_total = int(actual_seq_lengths_q_prev[-1])
+        next_total = int(actual_seq_lengths_q_next[-1])
+        q_prev = q[:prev_total]
+        q_next = q[prev_total : prev_total + next_total]
+        weights_prev, weights_next = None, None
+        if indexer_weights is not None:
+            weights_prev = indexer_weights[:prev_total].contiguous().view(
+                -1, indexer_weights.shape[-1]
+            )
+            weights_next = indexer_weights[
+                prev_total : prev_total + next_total
+            ].contiguous().view(-1, indexer_weights.shape[-1])
 
         topk_indices_prev = torch_npu.npu_lightning_indexer(
             query=q_prev,
@@ -441,7 +450,15 @@ class DSANPUIndexerMixin:
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
+        # Restore the physical row layout: logical results back to their
+        # original offsets, padding rows zeroed so downstream slicing by row
+        # index stays aligned.
+        topk_prev = topk_indices_prev[0].squeeze(1)
+        topk_next = topk_indices_next[0].squeeze(1)
+        topk_indices = topk_prev.new_zeros((q.size(0), topk_prev.shape[-1]))
+        topk_indices[:prev_total] = topk_prev[:prev_total]
+        topk_indices[prev_total : prev_total + next_total] = topk_next[:next_total]
+        return topk_indices
 
 
 def scattered_to_tp_attn_full(
