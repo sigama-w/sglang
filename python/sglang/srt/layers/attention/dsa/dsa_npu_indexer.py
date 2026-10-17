@@ -5,6 +5,7 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.interleave import interleave_rows_per_request
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -395,13 +396,34 @@ class DSANPUIndexerMixin:
         (``layout_query="TND"`` with one query per batch).
         """
         meta = forward_batch.attn_cp_metadata
-        per_request_rows = (
-            meta.actual_seq_q_prev_tensor + meta.actual_seq_q_next_tensor
-        ).to(block_table.device, torch.int64)
+        # Recompute the per-request row counts from the live batch instead of
+        # trusting the cached metadata tensors: under overlap/disagg scheduling
+        # the cached counts can describe a different batch than the tensors
+        # that actually reach this layer (observed 370 declared vs 368 real
+        # rows), and every TND kernel input must agree on the same dim 0.
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if extend_lens is not None:
+            parallel = get_parallel()
+            counts = interleave_rows_per_request(
+                [int(x) for x in extend_lens],
+                parallel.attn_cp_rank,
+                parallel.attn_cp_size,
+            )
+            per_request_rows = torch.tensor(
+                counts, dtype=torch.int64, device=block_table.device
+            )
+        else:
+            per_request_rows = (
+                meta.actual_seq_q_prev_tensor + meta.actual_seq_q_next_tensor
+            ).to(block_table.device, torch.int64)
+        # The actual shard rows are the leading rows of the counted layout, so
+        # trimming trailing phantom rows keeps every remaining row's request
+        # mapping correct.
         total = int(per_request_rows.sum())
-        block_table = block_table[: per_request_rows.numel()].repeat_interleave(
+        total = min(total, q.size(0), positions.size(0))
+        token_block_table = block_table[: per_request_rows.numel()].repeat_interleave(
             per_request_rows, dim=0
-        )
+        )[:total]
         num_rows = q.size(0)
         q = q[:total]
         if indexer_weights is not None:
@@ -415,6 +437,11 @@ class DSANPUIndexerMixin:
                 dtype=torch.int32,
                 device=q.device,
             )
+        # Stash the per-token kernel inputs for the sparse-attention half of
+        # this layer, which consumes the identical pseudo-batch layout.
+        forward_metadata = get_attn_backend().forward_metadata
+        forward_metadata.cp_prefill_token_block_table = token_block_table
+        forward_metadata.cp_prefill_local_positions = positions[:total]
         # Absolute causal end of each row: prefix-aware positions already
         # include the prefix offset, so the bound is positions + 1.
         kv_bound = (positions[:total] + 1).to(torch.int32)
@@ -427,7 +454,7 @@ class DSANPUIndexerMixin:
             weights=indexer_weights,
             actual_seq_lengths_query=seq_q,
             actual_seq_lengths_key=kv_bound,
-            block_table=block_table,
+            block_table=token_block_table,
             layout_query="TND",
             layout_key="PA_BSND",
             sparse_count=self.index_topk,

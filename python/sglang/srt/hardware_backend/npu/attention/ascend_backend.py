@@ -124,6 +124,13 @@ class ForwardMetadata:
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
+    # DSA prefill-CP per-token pseudo-batch inputs. The indexer recomputes
+    # them from the live batch (cached CP metadata counts can mismatch the
+    # tensors actually reaching the layer) and stashes them here for the
+    # sparse-attention half, which consumes the identical layout.
+    cp_prefill_local_positions: Optional[torch.Tensor] = None
+    cp_prefill_token_block_table: Optional[torch.Tensor] = None
+
 
 class AscendAttnMaskBuilder:
     def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
@@ -1197,86 +1204,48 @@ class AscendAttnBackend(AttentionBackend):
         k_pe,
         topk_indices,
         layer,
-        actual_seq_qlen,
-        actual_seq_lengths_kv,
     ):
-        seq_len = q_nope.shape[0]
-        actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
-        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
-        # The q tensors carry physical padding rows while the declared TND
-        # counts are logical. Slice each half down to its logical rows (a
-        # prefix of the physical layout) before the kernel calls, then place
-        # the results back into a full physical-shaped buffer; the rows
-        # straddling the physical midpoint would otherwise fall outside the
-        # declared counts and be dropped by the kernel.
-        prev_total = int(actual_seq_qlen_prev[-1])
-        next_total = int(actual_seq_qlen_next[-1])
-        q_nope_prev = q_nope[:prev_total].contiguous()
-        q_nope_next = q_nope[prev_total : prev_total + next_total].contiguous()
-        q_rope_prev = q_pe[:prev_total].contiguous()
-        q_rope_next = q_pe[prev_total : prev_total + next_total].contiguous()
-        topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        topk_indices_prev = topk_indices[:prev_total]
-        topk_indices_next = topk_indices[prev_total : prev_total + next_total]
-        # Skip empty halves: a short request can leave a rank with fewer
-        # logical rows than the half split, and the kernel rejects empty
-        # query tensors.
-        attn_out_prev = None
-        attn_out_next = None
-        if prev_total > 0:
-            attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
-                query=q_nope_prev,
-                key=k_nope,
-                value=k_nope,
-                query_rope=q_rope_prev,
-                key_rope=k_pe,
-                sparse_indices=topk_indices_prev,
-                scale_value=layer.scaling,
-                actual_seq_lengths_query=actual_seq_qlen_prev.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                return_softmax_lse=False,
-            )
-        if next_total > 0:
-            attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
-                query=q_nope_next,
-                key=k_nope,
-                value=k_nope,
-                query_rope=q_rope_next,
-                key_rope=k_pe,
-                sparse_indices=topk_indices_next,
-                scale_value=layer.scaling,
-                actual_seq_lengths_query=actual_seq_qlen_next.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                return_softmax_lse=False,
-            )
-        attn_out = torch.zeros_like(q_nope)
-        if attn_out_prev is not None:
-            attn_out = attn_out.to(attn_out_prev.dtype)
-            attn_out[:prev_total] = attn_out_prev[:prev_total]
-        if attn_out_next is not None:
-            attn_out = attn_out.to(attn_out_next.dtype)
-            attn_out[prev_total : prev_total + next_total] = attn_out_next[:next_total]
-        return attn_out
+        # Per-token pseudo-batch, mirroring the indexer half of this layer:
+        # one single-query batch per logical row with its own absolute causal
+        # bound. The counts stashed by the indexer are recomputed from the
+        # live batch, so all TND inputs share the same dim 0 even when
+        # overlap scheduling delivers a batch different from the cached CP
+        # metadata (the observed 370 declared vs 368 real rows mismatch).
+        local_positions = self.forward_metadata.cp_prefill_local_positions
+        token_block_table = self.forward_metadata.cp_prefill_token_block_table
+        total = int(local_positions.size(0))
+        if total == 0:
+            return torch.zeros_like(q_nope)
+        seq_q = torch.arange(
+            1, total + 1, dtype=torch.int32, device=q_nope.device
+        )
+        # Absolute causal end of each row: prefix-aware positions already
+        # include the prefix offset, so the bound is positions + 1.
+        kv_bound = (local_positions + 1).to(torch.int32)
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)[:total]
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope[:total].contiguous(),
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_pe[:total].contiguous(),
+            key_rope=k_pe,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=seq_q,
+            actual_seq_lengths_kv=kv_bound,
+            block_table=token_block_table,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+        # Restore the physical row layout; padding rows are never consumed
+        # downstream.
+        attn_out_full = torch.zeros_like(q_nope).to(attn_out.dtype)
+        attn_out_full[:total] = attn_out
+        return attn_out_full
 
     def do_cp_attn_fia(
         self,
@@ -1434,8 +1403,6 @@ class AscendAttnBackend(AttentionBackend):
                 k_pe,
                 topk_indices,
                 layer,
-                actual_seq_qlen,
-                actual_seq_lengths_kv,
             )
         else:
             if topk_indices is not None:
