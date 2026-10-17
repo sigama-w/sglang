@@ -5,6 +5,7 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -239,8 +240,12 @@ class DSANPUIndexerMixin:
                 and forward_batch.attn_cp_metadata is not None
             ):
                 get_attn_backend().forward_metadata.actual_seq_lengths_q = (
-                    forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
-                    forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
+                    forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor.cumsum(
+                        dim=0
+                    ),
+                    forward_batch.attn_cp_metadata.actual_seq_q_next_tensor.cumsum(
+                        dim=0
+                    ),
                 )
                 if sum(forward_batch.extend_prefix_lens_cpu) > 0:
                     total_kv_len_prev_tensor = (
@@ -313,10 +318,24 @@ class DSANPUIndexerMixin:
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
                 weights,
+                positions,
                 actual_seq_lengths_q,
                 actual_seq_lengths_kv,
                 block_table,
             )
+            if isinstance(
+                forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
+            ):
+                # The half-split kernel calls carry a single per-half kv bound,
+                # which is only exact when local rows are contiguous (zigzag).
+                # Interleave rows sit cp_size apart, so the half bound lets the
+                # indexer select candidates past each row's own causal end and
+                # the sparse-attention kernel (whose aligned-causal bound is
+                # likewise permissive) would attend to future tokens. Clamp the
+                # selected indices to the row's absolute position; CUDA avoids
+                # this with per-token ks/ke bounds instead.
+                limit = positions.to(topk_indices.dtype).view(-1, 1)
+                topk_indices = torch.minimum(topk_indices, limit)
             return topk_indices
         else:
             block_table = (
@@ -373,6 +392,7 @@ class DSANPUIndexerMixin:
         q,
         past_key_states,
         indexer_weights,
+        positions,
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
         block_table,
