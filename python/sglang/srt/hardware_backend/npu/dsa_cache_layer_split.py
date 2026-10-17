@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,13 @@ class NPULayerSplitMLATokenToKVPool(NPUMLATokenToKVPool):
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
-        # Layer whose buffers currently populate the remote scratch, mirroring
-        # the CUDA pool's remote_kv_layer_id bookkeeping (cache hit skips the
-        # broadcast; any write to the layer invalidates it).
-        self.remote_layer_id: Optional[int] = None
+        # Layers whose buffers currently populate the remote scratch, mirroring
+        # the CUDA pool's remote_kv_layer_id bookkeeping (a cache hit skips the
+        # broadcast; any write to the layer invalidates it). KV (k+v) and index
+        # (index_k + scale) scratch are cached independently so an attention
+        # read does not re-broadcast indexer buffers and vice versa.
+        self.remote_kv_layer_id: Optional[int] = None
+        self.remote_index_layer_id: Optional[int] = None
         super().__init__(*args, **kwargs)
         owned_start, _ = self._owned_local_layer_range()
         # First global layer owned by this rank; consumed by PD transfer
@@ -229,7 +233,7 @@ class NPULayerSplitMLATokenToKVPool(NPUMLATokenToKVPool):
         # Every rank joins the owner-broadcast for every layer read (the owner
         # sources it), otherwise the HCCL collective would hang on mismatched
         # participation. Owned layers still read their local buffer.
-        self._broadcast_layer(layer_id)
+        self._broadcast_kv_layer(layer_id)
         if self._is_layer_owned(layer_id):
             return super().get_kv_buffer(layer_id)
         return (
@@ -241,7 +245,7 @@ class NPULayerSplitMLATokenToKVPool(NPUMLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
-        self._broadcast_layer(layer_id)
+        self._broadcast_kv_layer(layer_id)
         if self._is_layer_owned(layer_id):
             return super().get_key_buffer(layer_id)
         return self._maybe_view_dtype(self.remote_k_buffer)
@@ -250,7 +254,7 @@ class NPULayerSplitMLATokenToKVPool(NPUMLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
-        self._broadcast_layer(layer_id)
+        self._broadcast_kv_layer(layer_id)
         if self._is_layer_owned(layer_id):
             return super().get_value_buffer(layer_id)
         return self._maybe_view_dtype(self.remote_v_buffer)
@@ -260,7 +264,7 @@ class NPULayerSplitMLATokenToKVPool(NPUMLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         if self.index_k_buffer is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
-        self._broadcast_layer(layer_id)
+        self._broadcast_index_layer(layer_id)
         if self._is_layer_owned(layer_id):
             return super().get_index_k_buffer(layer_id)
         return self._maybe_view_dtype(self.remote_index_k_buffer)
@@ -268,46 +272,99 @@ class NPULayerSplitMLATokenToKVPool(NPUMLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        self._broadcast_layer(layer_id)
+        self._broadcast_index_layer(layer_id)
         if self._is_layer_owned(layer_id):
             return super().get_index_k_scale_buffer(layer_id)
         return self.remote_index_k_scale_buffer
 
-    def _broadcast_layer(self, layer_id: int) -> None:
-        """Refresh every remote scratch with ``layer_id``'s owner data."""
-        if self.remote_layer_id == layer_id:
+    def _broadcast_kv_layer(self, layer_id: int) -> None:
+        """Refresh the k/v remote scratch with ``layer_id``'s owner data."""
+        if self.remote_kv_layer_id == layer_id:
             # Scratch already holds this layer's latest owner broadcast.
             return
         k_src = v_src = None
-        index_src = scale_src = None
         if self._is_layer_owned(layer_id):
             offset = self._kv_local_offset(layer_id)
             k_src = self.k_buffer[offset]
             if self.v_buffer is not None:
                 v_src = self.v_buffer[offset]
+        self._broadcast_to_owner_scratch(self.remote_k_buffer, layer_id, k_src)
+        if self.remote_v_buffer is not None:
+            self._broadcast_to_owner_scratch(self.remote_v_buffer, layer_id, v_src)
+        self.remote_kv_layer_id = layer_id
+
+    def _broadcast_index_layer(self, layer_id: int) -> None:
+        """Refresh the indexer remote scratch with ``layer_id``'s owner data."""
+        if self.remote_index_layer_id == layer_id:
+            return
+        if self.remote_index_k_buffer is None:
+            return
+        index_src = scale_src = None
+        if self._is_layer_owned(layer_id):
             slot = self.indexer_layer_id_to_slot.get(layer_id)
             if slot is not None:
                 index_src = self.index_k_buffer[slot]
                 if self.index_k_scale_buffer is not None:
                     scale_src = self.index_k_scale_buffer[slot]
-        self._broadcast_to_owner_scratch(self.remote_k_buffer, layer_id, k_src)
-        if self.remote_v_buffer is not None:
-            self._broadcast_to_owner_scratch(self.remote_v_buffer, layer_id, v_src)
-        if self.remote_index_k_buffer is not None:
+        self._broadcast_to_owner_scratch(
+            self.remote_index_k_buffer, layer_id, index_src
+        )
+        if self.remote_index_k_scale_buffer is not None:
             self._broadcast_to_owner_scratch(
-                self.remote_index_k_buffer, layer_id, index_src
+                self.remote_index_k_scale_buffer, layer_id, scale_src
             )
-            if self.remote_index_k_scale_buffer is not None:
-                self._broadcast_to_owner_scratch(
-                    self.remote_index_k_scale_buffer, layer_id, scale_src
-                )
-        self.remote_layer_id = layer_id
+        self.remote_index_layer_id = layer_id
 
     def _invalidate_remote_layer(self, layer_id: int) -> None:
         # A write to ``layer_id`` (local or remote via the owner) makes any
         # cached remote copy stale; drop it so the next read re-broadcasts.
-        if self.remote_layer_id == layer_id:
-            self.remote_layer_id = None
+        if self.remote_kv_layer_id == layer_id:
+            self.remote_kv_layer_id = None
+        if self.remote_index_layer_id == layer_id:
+            self.remote_index_layer_id = None
+
+    def prefetch_kv_buffer(
+        self,
+        layer_id: int,
+        layer_transfer_counter: Optional["LayerDoneCounter"] = None,
+        layer_transfer_idx: Optional[int] = None,
+    ) -> None:
+        """Eagerly fill the k/v remote scratch with ``layer_id``'s owner data.
+
+        Parity with the CUDA pool's prefetch hook
+        (``DeepseekV2DecoderLayer.maybe_prefetch_next_full_attention_kv``):
+        the following kv read of ``layer_id`` then hits the
+        ``remote_kv_layer_id`` cache instead of issuing a fresh broadcast.
+        NPU broadcasts run on the current stream, so unlike the CUDA side
+        stream this is a synchronous prefetch.
+        """
+        if layer_transfer_counter is not None and layer_transfer_idx is not None:
+            layer_transfer_counter.wait_until(layer_transfer_idx)
+        self._broadcast_kv_layer(layer_id)
+
+    # ---- PD transfer layer span --------------------------------------------
+
+    def get_kv_transfer_layer_span(self, num_entries: int) -> int:
+        """Number of layers covered by ``num_entries`` contiguous buf entries.
+
+        ``get_contiguous_buf_infos`` on the NPU MLA pool reports one entry per
+        layer per buffer group (k, non-fp8 v, index-k, fp8 index scale —
+        mirroring ``_get_disagg_buffer_entries``), so the owned layer count is
+        the entry count divided by the group count — not the entry count
+        itself, which is what the CUDA packed-kv layout assumes.
+        """
+        groups = 1  # k
+        if not self.dsa_kv_cache_store_fp8:
+            groups += 1  # v
+        if self.index_head_dim is not None:
+            groups += 1  # index_k
+            if self.index_k_scale_buffer is not None:
+                groups += 1  # index scale
+        assert groups > 0 and num_entries % groups == 0, (
+            f"layer-split transfer reported {num_entries} entries, "
+            f"not a multiple of {groups} buffer groups"
+        )
+        return num_entries // groups
 
     # ---- writes: owned layers only -----------------------------------------
 
