@@ -76,6 +76,15 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
     moe_local_token_count: Optional[torch.Tensor] = None
+    # Per-request prev/next half-split metadata consumed by the NPU DSA
+    # indexer and sparse-attention kernels, mirroring the zigzag metadata.
+    # Interleave spreads each request's rows across the whole local shard, so
+    # the counts and KV bounds derive from flattened token positions rather
+    # than contiguous blocks.
+    actual_seq_q_prev_tensor: Optional[torch.Tensor] = None
+    actual_seq_q_next_tensor: Optional[torch.Tensor] = None
+    kv_len_prev_tensor: Optional[torch.Tensor] = None
+    kv_len_next_tensor: Optional[torch.Tensor] = None
 
 
 def is_interleave_extend(forward_batch):
@@ -180,11 +189,64 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             base_len + (rank < extra) for rank in range(self.cp_size)
         ]
 
+        # Per-request half-split metadata for the NPU DSA kernels, which split
+        # the local rows into [prev = first (n+1)//2, next = rest] and run one
+        # TND kernel call per half. Under interleave the local rows are the
+        # flattened tokens at positions ≡ cp_rank (mod cp_size) in ascending
+        # order, so request b's rows form the contiguous row range
+        # [j_start, j_end) computed below. The KV bound of a half is the
+        # extend-relative causal end of its last row (the caller adds
+        # extend_prefix_lens on top), matching the zigzag semantics.
+        cp_rank, cp_size = self.cp_rank, self.cp_size
+        half_rows = (per_rank_actual_token[cp_rank] + 1) // 2
+        q_prev_counts: List[int] = []
+        q_next_counts: List[int] = []
+        kv_len_prev: List[int] = []
+        kv_len_next: List[int] = []
+        row_start = 0
+        for extend_len in extend_seqs_len:
+            row_end = row_start + extend_len
+            j_start = max(0, -(-(row_start - cp_rank) // cp_size))
+            j_end = (row_end - cp_rank + cp_size - 1) // cp_size
+            j_first_next = min(j_end, half_rows)
+            prev_rows = max(0, j_first_next - j_start)
+            next_rows = max(0, j_end - j_first_next)
+            q_prev_counts.append(prev_rows)
+            q_next_counts.append(next_rows)
+            kv_len_prev.append(
+                cp_rank + (j_first_next - 1) * cp_size - row_start + 1
+                if prev_rows > 0
+                else 0
+            )
+            kv_len_next.append(
+                cp_rank + (j_end - 1) * cp_size - row_start + 1 if next_rows > 0 else 0
+            )
+            row_start = row_end
+
+        try:
+            from sglang.srt.utils import get_device
+
+            device = torch.device(get_device().device)
+        except Exception:
+            device = torch.device("cpu")
+
         return InterleaveContextParallelMetadata(
             per_rank_actual_token=per_rank_actual_token,
             max_rank_len=[max(per_rank_actual_token)] * self.cp_size,
             total_seq_lens=total_seq_lens,
             bs=len(extend_seqs_len),
+            actual_seq_q_prev_tensor=torch.tensor(
+                q_prev_counts, device=device, dtype=torch.int32
+            ),
+            actual_seq_q_next_tensor=torch.tensor(
+                q_next_counts, device=device, dtype=torch.int32
+            ),
+            kv_len_prev_tensor=torch.tensor(
+                kv_len_prev, device=device, dtype=torch.int32
+            ),
+            kv_len_next_tensor=torch.tensor(
+                kv_len_next, device=device, dtype=torch.int32
+            ),
         )
 
     def shard_hidden_states(self, x: Any, forward_batch) -> Any:
