@@ -1218,54 +1218,64 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
         topk_indices_prev = topk_indices[:prev_total]
         topk_indices_next = topk_indices[prev_total : prev_total + next_total]
-
-        attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_prev,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_prev,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_prev,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
-        attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_next,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_next,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_next,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
-        attn_out = torch.zeros_like(q_nope).to(attn_out_prev.dtype)
-        attn_out[:prev_total] = attn_out_prev[:prev_total]
-        attn_out[prev_total : prev_total + next_total] = attn_out_next[:next_total]
+        # Skip empty halves: a short request can leave a rank with fewer
+        # logical rows than the half split, and the kernel rejects empty
+        # query tensors.
+        attn_out_prev = None
+        attn_out_next = None
+        if prev_total > 0:
+            attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_nope_prev,
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_rope_prev,
+                key_rope=k_pe,
+                sparse_indices=topk_indices_prev,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=actual_seq_qlen_prev.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+        if next_total > 0:
+            attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_nope_next,
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_rope_next,
+                key_rope=k_pe,
+                sparse_indices=topk_indices_next,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=actual_seq_qlen_next.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+        attn_out = torch.zeros_like(q_nope)
+        if attn_out_prev is not None:
+            attn_out = attn_out.to(attn_out_prev.dtype)
+            attn_out[:prev_total] = attn_out_prev[:prev_total]
+        if attn_out_next is not None:
+            attn_out = attn_out.to(attn_out_next.dtype)
+            attn_out[prev_total : prev_total + next_total] = attn_out_next[:next_total]
         return attn_out
 
     def do_cp_attn_fia(

@@ -409,55 +409,73 @@ class DSANPUIndexerMixin:
         next_total = int(actual_seq_lengths_q_next[-1])
         q_prev = q[:prev_total]
         q_next = q[prev_total : prev_total + next_total]
-        weights_prev, weights_next = None, None
-        if indexer_weights is not None:
-            weights_prev = indexer_weights[:prev_total].contiguous().view(
-                -1, indexer_weights.shape[-1]
+        # A short request can leave a rank with fewer logical rows than the
+        # half split, producing an empty half; the kernel rejects empty query
+        # tensors, so skip that call and leave the half zeroed.
+        topk_prev = None
+        topk_next = None
+        if prev_total > 0:
+            weights_prev = None
+            if indexer_weights is not None:
+                weights_prev = indexer_weights[:prev_total].contiguous().view(
+                    -1, indexer_weights.shape[-1]
+                )
+            topk_indices_prev = torch_npu.npu_lightning_indexer(
+                query=q_prev,
+                key=past_key_states,
+                weights=weights_prev,
+                actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
             )
-            weights_next = indexer_weights[
-                prev_total : prev_total + next_total
-            ].contiguous().view(-1, indexer_weights.shape[-1])
-
-        topk_indices_prev = torch_npu.npu_lightning_indexer(
-            query=q_prev,
-            key=past_key_states,
-            weights=weights_prev,
-            actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
-                device=q.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
-                device=q.device, dtype=torch.int32
-            ),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
-        topk_indices_next = torch_npu.npu_lightning_indexer(
-            query=q_next,
-            key=past_key_states,
-            weights=weights_next,
-            actual_seq_lengths_query=actual_seq_lengths_q_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
+            topk_prev = topk_indices_prev[0].squeeze(1)
+        if next_total > 0:
+            weights_next = None
+            if indexer_weights is not None:
+                weights_next = indexer_weights[
+                    prev_total : prev_total + next_total
+                ].contiguous().view(-1, indexer_weights.shape[-1])
+            topk_indices_next = torch_npu.npu_lightning_indexer(
+                query=q_next,
+                key=past_key_states,
+                weights=weights_next,
+                actual_seq_lengths_query=actual_seq_lengths_q_next.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+            )
+            topk_next = topk_indices_next[0].squeeze(1)
+        if topk_prev is None and topk_next is None:
+            # Every local row is padding; nothing is consumed downstream.
+            return torch.zeros(
+                (q.size(0), self.index_topk),
+                dtype=torch.int32,
+                device=q.device,
+            )
         # Restore the physical row layout: logical results back to their
         # original offsets, padding rows zeroed so downstream slicing by row
         # index stays aligned.
-        topk_prev = topk_indices_prev[0].squeeze(1)
-        topk_next = topk_indices_next[0].squeeze(1)
-        topk_indices = topk_prev.new_zeros((q.size(0), topk_prev.shape[-1]))
-        topk_indices[:prev_total] = topk_prev[:prev_total]
-        topk_indices[prev_total : prev_total + next_total] = topk_next[:next_total]
+        ref = topk_prev if topk_prev is not None else topk_next
+        topk_indices = ref.new_zeros((q.size(0), ref.shape[-1]))
+        if topk_prev is not None:
+            topk_indices[:prev_total] = topk_prev[:prev_total]
+        if topk_next is not None:
+            topk_indices[prev_total : prev_total + next_total] = topk_next[:next_total]
         return topk_indices
 
 
