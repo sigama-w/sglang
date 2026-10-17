@@ -397,7 +397,7 @@ class DSANPUIndexerMixin:
         meta = forward_batch.attn_cp_metadata
         per_request_rows = (
             meta.actual_seq_q_prev_tensor + meta.actual_seq_q_next_tensor
-        ).to(torch.int64)
+        ).to(block_table.device, torch.int64)
         total = int(per_request_rows.sum())
         block_table = block_table[: per_request_rows.numel()].repeat_interleave(
             per_request_rows, dim=0
