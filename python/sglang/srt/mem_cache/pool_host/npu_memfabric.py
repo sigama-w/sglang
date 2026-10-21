@@ -1,12 +1,12 @@
-"""Memfabric-mapped host DRAM and AscendC sparse-copy IO path (NPU only).
+"""Memfabric-mapped host DRAM (NPU only).
 
 torch pin_memory buffers are only reachable by the SDMA engine; AIV kernels
-(e.g. offload.sparse_copy) can only de-reference host VAs that were mapped
-into the device VA space via the Memfabric offload entity (DRAM_MAP_HOST_VA,
-see acc_offload_local_dram_entry.cpp).  SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric
-is the single switch for the whole feature: the HiCache host pool is
-allocated through memfabric_hybrid.offload.empty AND the L2<->L1 IO uses
-the AIV sparse-copy kernel (see ascendc_io_enabled).
+can only de-reference host VAs that were mapped into the device VA space.
+SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric allocates the HiCache host pool
+through memfabric_hybrid.offload.empty for that purpose; the sibling
+SGLANG_HICACHE_HOST_MEM_BACKEND=kernel_npu backend (see npu_kernel_offload)
+uses the sgl-kernel-npu hugepage allocator instead and shares the same AIV
+IO control flow (see ascendc_io_enabled there).
 """
 
 from __future__ import annotations
@@ -33,17 +33,6 @@ def memfabric_host_memory_enabled() -> bool:
     return os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND", "").lower() == (
         "memfabric"
     )
-
-
-def ascendc_io_enabled() -> bool:
-    """Use the acc_offload AIV sparse-copy kernel for HiCache L2<->L1 IO.
-
-    Rides on the single memfabric switch: SGLANG_HICACHE_HOST_MEM_BACKEND=
-    memfabric enables both the host pool allocation and this IO path (the
-    AIV kernel de-references host pool pointers, which requires
-    Memfabric-mapped memory).
-    """
-    return memfabric_host_memory_enabled()
 
 
 def _get_memfabric_offload():

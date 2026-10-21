@@ -30,9 +30,15 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host.npu_kernel_offload import (
+    alloc_with_kernel_npu,
+    ascendc_io_enabled,
+    ensure_kernel_npu_capacity,
+    kernel_npu_host_memory_enabled,
+    launch_kv_exchange,
+)
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     alloc_with_memfabric,
-    ascendc_io_enabled,
     ensure_memfabric_capacity,
     memfabric_host_memory_enabled,
     to_device_no_sync,
@@ -341,11 +347,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 k_width = native.k_width
             else:
                 k_width = self.kv_lora_rank
-            if _is_npu and memfabric_host_memory_enabled():
-                # Memfabric-mapped host DRAM (single switch): required by the
-                # AIV sparse-copy IO path and usable by the legacy memcpy2d
-                # path unchanged.  Size the GB-aligned reserve with the
-                # combined bytes of all buffers allocated below.
+            if _is_npu and (
+                memfabric_host_memory_enabled() or kernel_npu_host_memory_enabled()
+            ):
+                # AIV-de-referencable host DRAM (single switch): required by
+                # the AIV sparse-copy IO path and usable by the legacy
+                # memcpy2d path unchanged.  Size the GB-aligned reserve with
+                # the combined bytes of all buffers allocated below.
+                #   memfabric  -> memfabric_hybrid offload.empty (giant pages)
+                #   kernel_npu -> sgl-kernel-npu hugepage_host_alloc (1G
+                #                 hugepage mmap + halHostRegister)
                 total_bytes = (
                     self.page_num
                     * self.page_size
@@ -366,8 +377,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     total_bytes += (
                         self.page_num * self.page_size * num_indexer_layers * 4
                     )
-                ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
-                alloc_func = alloc_with_memfabric
+                if memfabric_host_memory_enabled():
+                    ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
+                    alloc_func = alloc_with_memfabric
+                else:
+                    ensure_kernel_npu_capacity(total_bytes, torch.npu.current_device())
+                    alloc_func = alloc_with_kernel_npu
             self.k_buffer = alloc_func(
                 (*base_dims, k_width),
                 dtype=self.dtype,
@@ -657,6 +672,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     def _launch_ascendc_kv_exchange(self, vals: list, device) -> None:
         """Rewrite host bases to DVAs and launch the AIV sparse-copy kernel."""
+        if kernel_npu_host_memory_enabled():
+            # sgl-kernel-npu backend: host bases are resolved through the
+            # hugepage allocator registry inside launch_kv_exchange.
+            launch_kv_exchange(vals, device)
+            return
+
         from memfabric_hybrid import offload
 
         vals = self._rewrite_host_base_to_dva(vals)
