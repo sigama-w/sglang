@@ -91,7 +91,10 @@ def ensure_memfabric_capacity(total_bytes: int, device_id: int) -> None:
         config.device_id = device_id
         config.reserve_size = total_bytes
         config.alloc_size = total_bytes
-        config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
+        # OFFLOAD_FLAG_GIANT_PAGE is a perf optimization that only exists on
+        # the newer memfabric packages (br_feature_a5_offload); degrade to the
+        # default page size on older installs so the fallback path still runs.
+        config.flags = getattr(offload, "OFFLOAD_FLAG_GIANT_PAGE", 0)
         config.scene = offload.Scene.LOCAL
         assert offload.initialize(config) == 0, "offload.initialize failed"
         _memfabric_state.update(
