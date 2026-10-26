@@ -370,9 +370,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     raise ValueError(
                         "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric now requires "
                         "SGLANG_HICACHE_NPU_BACKEND=memfabric: the aclrt "
-                        "host-registration + AIV kv_exchange path is the NPU "
-                        "default and its transfers cannot reach Memfabric-mapped "
-                        "host DRAM."
+                        "host-registration + AIV kv_exchange path cannot reach "
+                        "Memfabric-mapped host DRAM."
                     )
                 # Memfabric-mapped host DRAM (single switch): required by the
                 # AIV sparse-copy IO path and usable by the legacy memcpy2d

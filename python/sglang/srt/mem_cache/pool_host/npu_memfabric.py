@@ -36,17 +36,15 @@ def memfabric_host_memory_enabled() -> bool:
 
 
 def aclrt_aiv_backend_enabled() -> bool:
-    """Default NPU HiCache IO backend: aclrt registration + AIV kv_exchange.
+    """Opt-in NPU HiCache IO backend: aclrt registration + AIV kv_exchange.
 
-    The sgl-kernel-npu ops register host pool memory via aclrtHostRegister
-    (ACL_HOST_REGISTER_MAPPED) and transfer through the kv_exchange AIV-only
-    kernel, mirroring the CUDA direct path. Set SGLANG_HICACHE_NPU_BACKEND=
-    memfabric to restore the Memfabric host DRAM + acc_offload sparse-copy
-    path (which also requires SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric).
+    Set SGLANG_HICACHE_NPU_BACKEND=aclrt_aiv to route the HiCache L2<->L1 IO
+    through the sgl-kernel-npu kv_exchange ops (host pool memory registered
+    via aclrtHostRegister in python, mirroring the CUDA direct path). Unset
+    restores the original behavior: the memfabric sparse-copy path when
+    SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric, otherwise dim_exchange.
     """
-    return os.environ.get("SGLANG_HICACHE_NPU_BACKEND", "aclrt_aiv").lower() != (
-        "memfabric"
-    )
+    return os.environ.get("SGLANG_HICACHE_NPU_BACKEND", "").lower() == "aclrt_aiv"
 
 
 def ascendc_io_enabled() -> bool:
