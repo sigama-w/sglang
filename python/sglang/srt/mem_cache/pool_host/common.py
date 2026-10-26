@@ -22,6 +22,8 @@ _is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
+_NPU_HOST_REGISTERED_RANGES_ATTR = "_sglang_npu_host_registered_ranges"
+
 
 class HostTensorAllocator:
     def __init__(self):
@@ -237,6 +239,122 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
 
 
 @lru_cache(maxsize=1)
+def _is_npu_host_register_available() -> bool:
+    # The registration itself is pure python (acl.rt binding); the kernel-side
+    # requirement is just the AIV kv-exchange transfer ops.
+    return hasattr(torch.ops.npu, "transfer_kv_per_layer_direct_pf_lf") and hasattr(
+        torch.ops.npu, "transfer_kv_all_layer_direct_lf_pf"
+    )
+
+
+def _npu_host_register(
+    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+) -> None:
+    # Register host memory with aclrtHostRegister(ACL_HOST_REGISTER_MAPPED) so
+    # the AIV kv-exchange kernel can dereference a device-visible address (DVA).
+    # sgl_kernel_npu.kvcacheio.register_host_memory mirrors PR #39548: the
+    # aclrt calls go through the `acl.rt` python binding and return a
+    # HostMemoryMapping -- borrowed mappings (owned=False, e.g. a range already
+    # mapped by torch_npu's pinned allocator) must never be released here.
+    if not _is_npu_host_register_available():
+        raise RuntimeError(
+            "sgl_kernel_npu AIV kv-exchange ops are unavailable; rebuild "
+            "sgl-kernel-npu (aclrt_aiv branch) to enable NPU host registration."
+        )
+    from sgl_kernel_npu.kvcacheio import register_host_memory
+
+    total = buffer.numel() * buffer.element_size()
+    chunk_limit_bytes = (
+        max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
+    )
+    # Same reasoning as the CUDA path: keep the caller's copy-granularity
+    # alignment so a single transfer never spans two registrations.
+    chunk_bytes = total
+    if registration_granularity_bytes is not None:
+        if registration_granularity_bytes <= 0:
+            raise ValueError(
+                "registration_granularity_bytes must be positive, got "
+                f"{registration_granularity_bytes}"
+            )
+        if registration_granularity_bytes > chunk_limit_bytes:
+            raise ValueError(
+                "Host registration granularity exceeds the configured chunk limit: "
+                f"granularity={registration_granularity_bytes}, "
+                f"chunk_limit={chunk_limit_bytes}"
+            )
+        chunk_bytes = (
+            chunk_limit_bytes // registration_granularity_bytes
+        ) * registration_granularity_bytes
+    esz = buffer.element_size()
+    flat = buffer.view(-1)
+    registered_mappings: list = []
+    try:
+        offset = 0
+        while offset < total:
+            size = min(chunk_bytes, total - offset)
+            chunk = flat.narrow(0, offset // esz, size // esz)
+            registered_mappings.append(register_host_memory(chunk))
+            offset += size
+
+        # Keep the HostMemoryMapping of each registered chunk with the tensor;
+        # only owned mappings are released, each by its page-aligned
+        # registered host base.
+        setattr(buffer, _NPU_HOST_REGISTERED_RANGES_ATTR, registered_mappings)
+    except Exception:
+        remaining_mappings = _npu_host_unregister_ranges(
+            buffer, registered_mappings, operation="registration rollback"
+        )
+        if remaining_mappings:
+            setattr(buffer, _NPU_HOST_REGISTERED_RANGES_ATTR, remaining_mappings)
+        raise
+
+
+def _npu_host_unregister_ranges(
+    buffer: torch.Tensor,
+    registered_mappings: list,
+    *,
+    operation: str,
+) -> list:
+    from sgl_kernel_npu.kvcacheio import unregister_host_memory
+
+    failed_mappings = []
+    for mapping in reversed(registered_mappings):
+        if not mapping.owned:
+            # Borrowed mapping: not ours to release (PR #39548 rule).
+            continue
+        try:
+            unregister_host_memory(mapping)
+        except Exception as exc:
+            failed_mappings.append(mapping)
+            logger.warning(
+                "aclrtHostUnregister failed during %s for ptr=%#x: %s",
+                operation,
+                mapping.registered_host_ptr,
+                exc,
+            )
+    failed_mappings.reverse()
+    return failed_mappings
+
+
+def _npu_host_unregister(buffer: torch.Tensor) -> None:
+    if not _is_npu_host_register_available():
+        logger.warning(
+            "torch.ops.npu.aclrt_forget_host_mapping is unavailable; skipping "
+            "NPU host unregistration."
+        )
+        return
+    registered_mappings = getattr(buffer, _NPU_HOST_REGISTERED_RANGES_ATTR, None)
+    if registered_mappings is None:
+        # Nothing this code path registered; nothing to release.
+        return
+
+    remaining_mappings = _npu_host_unregister_ranges(
+        buffer, registered_mappings, operation="host-pool destroy"
+    )
+    setattr(buffer, _NPU_HOST_REGISTERED_RANGES_ATTR, remaining_mappings)
+
+
+@lru_cache(maxsize=1)
 def _hip_runtime() -> ctypes.CDLL:
     from sglang.srt.distributed.device_communicators.cuda_wrapper import (
         find_loaded_library,
@@ -365,6 +483,30 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_with_host_register_npu(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: HostTensorAllocator | None,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    """
+    Allocate tensor and register host memory with aclrtHostRegister, mirroring
+    the CUDA path. Registration returns a device-visible address (DVA) that the
+    AIV kv-exchange kernel in sgl-kernel-npu dereferences directly, so host
+    memory must be registered whenever pin_memory=True.
+    """
+    assert device == "cpu", f"HiCache host pools are CPU memory; got {device!r}"
+    if allocator is not None:
+        buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    else:
+        buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    if pin_memory:
+        _npu_host_register(buffer, registration_granularity_bytes)
+    return buffer
+
+
 def alloc_with_pin_memory_xpu(
     dims: tuple,
     dtype: torch.dtype,
@@ -453,7 +595,7 @@ def make_kernel_ptr_table(
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
-        "npu": alloc_with_pin_memory,
+        "npu": alloc_with_host_register_npu,
         "musa": alloc_with_pin_memory,
         "xpu": alloc_with_pin_memory_xpu,
     },

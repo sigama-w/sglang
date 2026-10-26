@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+    aclrt_aiv_backend_enabled,
     alloc_with_memfabric,
     ascendc_io_enabled,
     ensure_memfabric_capacity,
@@ -72,7 +73,12 @@ elif _is_xpu:
         transfer_kv_per_layer_mla_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    from sgl_kernel_npu.kvcacheio import (
+        TransferDirection,
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_dim_exchange,
+        transfer_kv_per_layer_direct_pf_lf,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +366,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 k_width = self.kv_lora_rank
             if _is_npu and memfabric_host_memory_enabled():
+                if aclrt_aiv_backend_enabled():
+                    raise ValueError(
+                        "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric now requires "
+                        "SGLANG_HICACHE_NPU_BACKEND=memfabric: the aclrt "
+                        "host-registration + AIV kv_exchange path is the NPU "
+                        "default and its transfers cannot reach Memfabric-mapped "
+                        "host DRAM."
+                    )
                 # Memfabric-mapped host DRAM (single switch): required by the
                 # AIV sparse-copy IO path and usable by the legacy memcpy2d
                 # path unchanged.  Size the GB-aligned reserve with the
@@ -516,6 +530,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         The kernel de-references host pool pointers directly, so the host
         pool must be Memfabric-mapped.
         """
+        # TEMP-LOG: should NOT appear when aclrt_aiv is the active backend.
+        logger.warning("[aclrt_aiv] FALLBACK hit: ascendc sparse-copy path")
         device = buffers.k.device
         # The kernel reads the token indices directly from device memory.
         # Upload without a stream sync: a plain .to(device) from pageable
@@ -686,6 +702,111 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
 
+    def _transfer_aclrt_aiv(
+        self,
+        buffers,
+        host_indices,
+        device_indices,
+        direction: TransferDirection,
+        *,
+        layer_id: int = -1,
+        index_k_layer_id: int = -1,
+    ) -> None:
+        """KV transfer via the sgl-kernel-npu aclrt + AIV kv_exchange ops.
+
+        Host pool memory is aclrtHostRegister-ed at allocation time; the op's
+        host API resolves every host base to its device-visible address (DVA),
+        derives the per-component layout pitches, assembles the kernel meta and
+        launches the AIV-only kv_exchange kernel — no python-side metadata
+        plumbing (mirrors the CUDA direct path).
+
+        ``layer_id >= 0`` restricts K/V to a single device layer (per-layer H2D
+        pipelining); ``index_k_layer_id >= 0`` maps Indexer K (plus the FP32
+        scale mirror) to its physical slot layer. The defaults transfer every
+        layer of each component (one-shot D2H backup).
+        """
+        # TEMP-LOG: verify the dispatch actually reaches the aclrt_aiv path.
+        logger.info(
+            "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
+            direction, layer_id, index_k_layer_id,
+        )
+        device = buffers.k.device
+        # The kernel reads the token indices directly from device memory.
+        # Upload without a stream sync: a plain .to(device) from pageable
+        # memory synchronizes the stream and would serialize the pipeline.
+        if host_indices.device.type != "npu":
+            host_indices = to_device_no_sync(host_indices, device)
+        if device_indices.device.type != "npu":
+            device_indices = to_device_no_sync(device_indices, device)
+        # The kernel runs on the current (load) stream while the indices were
+        # allocated on another stream; keep them alive until the copy retires.
+        stream = torch.npu.current_stream()
+        host_indices.record_stream(stream)
+        device_indices.record_stream(stream)
+
+        per_layer = direction == TransferDirection.H2D
+        if per_layer:
+            assert layer_id >= 0, "H2D per-layer transfer requires layer_id"
+
+        # K always transfers; FP8 DSA packs V into the device k_buffer and the
+        # device v_buffer is empty, so it must be skipped. The ops follow the
+        # CUDA direct-path contract -- data flows src -> dst, so H2D passes
+        # (src=host, dst=device) and D2H (src=device, dst=host). Host bases
+        # resolve to their registered DVAs inside the op (driver lookup).
+        dev_bufs = [buffers.k]
+        host_bufs = [self.k_buffer]
+        if buffers.v.numel() > 0 and self.v_buffer.numel() > 0:
+            dev_bufs.append(buffers.v)
+            host_bufs.append(self.v_buffer)
+        if per_layer:
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=host_bufs,
+                dst_ptrs=dev_bufs,
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                page_size=self.page_size,
+            )
+        else:
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=dev_bufs,
+                dst_ptrs=host_bufs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+
+        if self.index_k_buffer is None or buffers.index_k is None:
+            return
+        if per_layer and index_k_layer_id < 0:
+            # This layer owns no Indexer slot.
+            return
+        # The quantized-Indexer FP32 scale mirror rides along with Indexer K.
+        # Both scale caches are 4-D (no trailing width dim); the ops accept
+        # the 4-D form directly (width resolves to the page_size row).
+        ik_dev = [buffers.index_k]
+        ik_host = [self.index_k_buffer]
+        if self.index_k_scale_buffer is not None and buffers.index_scales is not None:
+            ik_dev.append(buffers.index_scales)
+            ik_host.append(self.index_k_scale_buffer)
+        if per_layer:
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=ik_host,
+                dst_ptrs=ik_dev,
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=index_k_layer_id,
+                page_size=self.page_size,
+            )
+        else:
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=ik_dev,
+                dst_ptrs=ik_host,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+
     if _is_xpu:
         # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
         # checked at construction; keep in step with their branches.
@@ -787,6 +908,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             native = self._native_infos[info_index].native_buffers()
             device_layer_id = 0 if is_draft else layer_id
             if self.layout == "page_first_kv_split":
+                if _is_npu and aclrt_aiv_backend_enabled():
+                    # Per-layer H2D via the sgl-kernel-npu AIV kv_exchange op;
+                    # host bases resolve to registered DVAs inside the op host
+                    # API. Indexer K/scale ride a separate call mapped to the
+                    # layer's physical Indexer slot.
+                    ik_start, ik_num = self._indexer_slot_range_for_layer(
+                        native, device_layer_id
+                    )
+                    self._transfer_aclrt_aiv(
+                        native,
+                        host_indices,
+                        device_indices,
+                        TransferDirection.H2D,
+                        layer_id=device_layer_id,
+                        index_k_layer_id=ik_start if ik_num == 1 else -1,
+                    )
+                    return
                 if _is_npu and ascendc_io_enabled():
                     # The per-layer complete(i) event recorded by the caller lets
                     # later layers' DMA overlap the current layer's compute.
@@ -809,6 +947,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # work on subsequent per-layer iterations.
                 if device_layer_id != 0:
                     return
+                # TEMP-LOG: should NOT appear when aclrt_aiv is the active backend.
+                logger.warning("[aclrt_aiv] FALLBACK hit: dim_exchange H2D path")
                 for (
                     native,
                     host_k,
@@ -1106,6 +1246,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "kernel_ascend":
             native = self._native_infos[0].native_buffers()
             if self.layout == "page_first_kv_split":
+                if _is_npu and aclrt_aiv_backend_enabled():
+                    self._transfer_aclrt_aiv(
+                        native, host_indices, device_indices, TransferDirection.D2H
+                    )
+                    return
                 if _is_npu and ascendc_io_enabled():
                     self._transfer_ascendc_sparse_copy(
                         native,
@@ -1114,6 +1259,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         TransferDirection.D2H,
                     )
                     return
+                # TEMP-LOG: should NOT appear when aclrt_aiv is the active backend.
+                logger.warning("[aclrt_aiv] FALLBACK hit: dim_exchange D2H path")
                 for (
                     native,
                     host_k,
