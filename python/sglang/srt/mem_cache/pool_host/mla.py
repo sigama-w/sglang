@@ -730,6 +730,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
             direction, layer_id, index_k_layer_id,
         )
+        # TEMP-LOG: production pool geometry for the pitch/layer-range audit.
+        logger.info(
+            "[aclrt_aiv] geom dev_k=%s(stride=%s) host_k=%s(stride=%s) "
+            "dev_idx=%s host_idx=%s ps=%s",
+            tuple(buffers.k.shape), tuple(buffers.k.stride()),
+            tuple(self.k_buffer.shape), tuple(self.k_buffer.stride()),
+            tuple(device_indices.shape), tuple(host_indices.shape),
+            self.page_size,
+        )
+        if self.index_k_buffer is not None and buffers.index_k is not None:
+            logger.info(
+                "[aclrt_aiv] geom ik dev=%s(stride=%s) host=%s(stride=%s) "
+                "scale_dev=%s scale_host=%s",
+                tuple(buffers.index_k.shape), tuple(buffers.index_k.stride()),
+                tuple(self.index_k_buffer.shape), tuple(self.index_k_buffer.stride()),
+                None if buffers.index_scales is None else tuple(buffers.index_scales.shape),
+                None if self.index_k_scale_buffer is None else tuple(self.index_k_scale_buffer.shape),
+            )
         device = buffers.k.device
         # The kernel reads the token indices directly from device memory.
         # Upload without a stream sync: a plain .to(device) from pageable
