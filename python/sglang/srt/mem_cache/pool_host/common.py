@@ -293,7 +293,19 @@ def _npu_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             chunk = flat.narrow(0, offset // esz, size // esz)
-            registered_mappings.append(register_host_memory(chunk))
+            mapping = register_host_memory(chunk)
+            if mapping is None:
+                # PR #39548 parity: the NPU platform wrapper raises instead of
+                # falling back -- an unregistered host pool would make the AIV
+                # kv_exchange op fail its DVA lookup (or worse, dereference a
+                # stale mapping) far away from the actual allocation bug.
+                raise RuntimeError(
+                    f"aclrtHostRegister failed for host pool chunk at "
+                    f"{chunk.data_ptr():#x} ({size} bytes); cannot use the "
+                    "aclrt_aiv kv-exchange path without a device-visible "
+                    "host pool"
+                )
+            registered_mappings.append(mapping)
             offset += size
 
         # Keep the HostMemoryMapping of each registered chunk with the tensor;

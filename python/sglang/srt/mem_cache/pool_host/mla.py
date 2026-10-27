@@ -751,30 +751,32 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             _capture_fn is not None,
             bool(_capture_fn and _capture_fn()),
         )
-        # Unit conversion (ROOT CAUSE of the 507035 vector core exceptions):
-        # the transfer interface hands out page-aligned TOKEN slot indices
-        # (cf. the ascendc path's `index // page_size` and dim_exchange's
-        # page_size parameter), while the kv_exchange kernel contract expects
-        # per-token PAGE indices. Passing a token id (e.g. 2943) straight
-        # through made the AIV kernel dereference it as a page number ->
-        # offset far outside the pool -> invalid GM address.
-        host_indices = host_indices // self.page_size
-        device_indices = device_indices // self.page_size
-        # TEMP-EXP1: index max values vs pool page counts -- any idx.max()
-        # >= its pool page count is a hard out-of-bounds for the AIV kernel
+        # The kv_exchange kernel contract is TOKEN slot indices, NOT page
+        # numbers: op_host derives num_pages = numel / page_size, and the
+        # kernel samples entry `page * page_size` and divides it by page_size
+        # itself (op_kernel LoadPages). This is identical to the ascendc path,
+        # which passes raw indices into the same meta layout. Do NOT pre-divide
+        # here: a python-side `// page_size` turns the entries into page
+        # numbers while numel stays at the token count, so the kernel's second
+        # /page_size collapses EVERY page onto page 0 -- in-bounds (no fault)
+        # but every H2D load would read host page 0 and every D2H backup would
+        # overwrite host page 0 (silent KV corruption).
+        ps = self.page_size
+        # TEMP-EXP1: page-level max vs pool page counts -- any value >= its
+        # pool page count is a hard out-of-bounds for the AIV kernel
         # (dev pool pages = dev_k.shape[1], host pool pages = host_k.shape[0]).
         logger.info(
             "[aclrt_aiv] geom dev_k=%s(stride=%s) host_k=%s(stride=%s) "
-            "dev_idx=%s(max=%s of %s) host_idx=%s(max=%s of %s) ps=%s",
+            "dev_idx=%s(page_max=%s of %s) host_idx=%s(page_max=%s of %s) ps=%s",
             tuple(buffers.k.shape), tuple(buffers.k.stride()),
             tuple(self.k_buffer.shape), tuple(self.k_buffer.stride()),
             tuple(device_indices.shape),
-            device_indices.max().item() if device_indices.numel() else -1,
+            device_indices.max().item() // ps if device_indices.numel() else -1,
             buffers.k.shape[1],
             tuple(host_indices.shape),
-            host_indices.max().item() if host_indices.numel() else -1,
+            host_indices.max().item() // ps if host_indices.numel() else -1,
             self.k_buffer.shape[0],
-            self.page_size,
+            ps,
         )
         if self.index_k_buffer is not None and buffers.index_k is not None:
             logger.info(
