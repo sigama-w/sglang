@@ -740,10 +740,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 f"(dir={direction} layer_id={layer_id}); refusing to launch "
                 "kv_exchange with a potentially broken meta upload"
             )
-        # TEMP-LOG: verify the dispatch actually reaches the aclrt_aiv path.
+        # TEMP-LOG: verify the dispatch actually reaches the aclrt_aiv path,
+        # and expose whether the capture-state guard API even exists (if
+        # capture_api=False the guard above can never fire).
+        _capture_fn = getattr(torch.npu, "is_current_stream_capturing", None)
         logger.info(
-            "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
+            "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s "
+            "capture_api=%s capturing=%s",
             direction, layer_id, index_k_layer_id,
+            _capture_fn is not None,
+            bool(_capture_fn and _capture_fn()),
         )
         # Unit conversion (ROOT CAUSE of the 507035 vector core exceptions):
         # the transfer interface hands out page-aligned TOKEN slot indices
