@@ -73,14 +73,7 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                     stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                # RELAXED lets sync copies (e.g. attention's seq-len .to(device))
-                # execute inside the capture window instead of being rejected by
-                # GLOBAL mode with EE1016 -- which leaves the target tensor
-                # uninitialized and later crashes a kernel with a vector core
-                # exception (invalid GM address, err 507035).
-                with torch.npu.graph(
-                    npugraph, pool=self.graph_pool, capture_error_mode="relaxed"
-                ):
+                with torch.npu.graph(npugraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:

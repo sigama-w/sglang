@@ -529,8 +529,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         The kernel de-references host pool pointers directly, so the host
         pool must be Memfabric-mapped.
         """
-        # TEMP-LOG: should NOT appear when aclrt_aiv is the active backend.
-        logger.warning("[aclrt_aiv] FALLBACK hit: ascendc sparse-copy path")
         device = buffers.k.device
         # The kernel reads the token indices directly from device memory.
         # Upload without a stream sync: a plain .to(device) from pageable
@@ -724,69 +722,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         scale mirror) to its physical slot layer. The defaults transfer every
         layer of each component (one-shot D2H backup).
         """
-        # TEMP-EXP2: GLOBAL capture mode rejects the sync meta upload (EE1016),
-        # leaving meta_dev uninitialized -> the AIV kv_exchange kernel would
-        # dereference garbage meta -> vector core exception 507035. Refuse to
-        # launch inside a capture window instead of crashing the stream.
-        if getattr(torch.npu, "is_current_stream_capturing", bool)():
-            if direction == TransferDirection.D2H:
-                logger.warning(
-                    "[aclrt_aiv] D2H backup skipped: thread is in a graph "
-                    "capture window (GLOBAL mode would break the meta upload)"
-                )
-                return
-            raise RuntimeError(
-                "H2D load requested inside a graph capture window "
-                f"(dir={direction} layer_id={layer_id}); refusing to launch "
-                "kv_exchange with a potentially broken meta upload"
-            )
-        # TEMP-LOG: verify the dispatch actually reaches the aclrt_aiv path,
-        # and expose whether the capture-state guard API even exists (if
-        # capture_api=False the guard above can never fire).
-        _capture_fn = getattr(torch.npu, "is_current_stream_capturing", None)
         logger.info(
-            "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s "
-            "capture_api=%s capturing=%s",
-            direction, layer_id, index_k_layer_id,
-            _capture_fn is not None,
-            bool(_capture_fn and _capture_fn()),
+            "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
+            direction,
+            layer_id,
+            index_k_layer_id,
         )
-        # The kv_exchange kernel contract is TOKEN slot indices, NOT page
-        # numbers: op_host derives num_pages = numel / page_size, and the
-        # kernel samples entry `page * page_size` and divides it by page_size
-        # itself (op_kernel LoadPages). This is identical to the ascendc path,
-        # which passes raw indices into the same meta layout. Do NOT pre-divide
-        # here: a python-side `// page_size` turns the entries into page
-        # numbers while numel stays at the token count, so the kernel's second
-        # /page_size collapses EVERY page onto page 0 -- in-bounds (no fault)
-        # but every H2D load would read host page 0 and every D2H backup would
-        # overwrite host page 0 (silent KV corruption).
-        ps = self.page_size
-        # TEMP-EXP1: page-level max vs pool page counts -- any value >= its
-        # pool page count is a hard out-of-bounds for the AIV kernel
-        # (dev pool pages = dev_k.shape[1], host pool pages = host_k.shape[0]).
-        logger.info(
-            "[aclrt_aiv] geom dev_k=%s(stride=%s) host_k=%s(stride=%s) "
-            "dev_idx=%s(page_max=%s of %s) host_idx=%s(page_max=%s of %s) ps=%s",
-            tuple(buffers.k.shape), tuple(buffers.k.stride()),
-            tuple(self.k_buffer.shape), tuple(self.k_buffer.stride()),
-            tuple(device_indices.shape),
-            device_indices.max().item() // ps if device_indices.numel() else -1,
-            buffers.k.shape[1],
-            tuple(host_indices.shape),
-            host_indices.max().item() // ps if host_indices.numel() else -1,
-            self.k_buffer.shape[0],
-            ps,
-        )
-        if self.index_k_buffer is not None and buffers.index_k is not None:
-            logger.info(
-                "[aclrt_aiv] geom ik dev=%s(stride=%s) host=%s(stride=%s) "
-                "scale_dev=%s scale_host=%s",
-                tuple(buffers.index_k.shape), tuple(buffers.index_k.stride()),
-                tuple(self.index_k_buffer.shape), tuple(self.index_k_buffer.stride()),
-                None if buffers.index_scales is None else tuple(buffers.index_scales.shape),
-                None if self.index_k_scale_buffer is None else tuple(self.index_k_scale_buffer.shape),
-            )
+        # kv_exchange takes token-slot indices and derives page numbers itself.
         device = buffers.k.device
         # The kernel reads the token indices directly from device memory.
         # Upload without a stream sync: a plain .to(device) from pageable
@@ -1004,8 +946,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # work on subsequent per-layer iterations.
                 if device_layer_id != 0:
                     return
-                # TEMP-LOG: should NOT appear when aclrt_aiv is the active backend.
-                logger.warning("[aclrt_aiv] FALLBACK hit: dim_exchange H2D path")
                 for (
                     native,
                     host_k,
@@ -1316,8 +1256,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         TransferDirection.D2H,
                     )
                     return
-                # TEMP-LOG: should NOT appear when aclrt_aiv is the active backend.
-                logger.warning("[aclrt_aiv] FALLBACK hit: dim_exchange D2H path")
                 for (
                     native,
                     host_k,
