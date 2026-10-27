@@ -724,18 +724,41 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         scale mirror) to its physical slot layer. The defaults transfer every
         layer of each component (one-shot D2H backup).
         """
+        # TEMP-EXP2: GLOBAL capture mode rejects the sync meta upload (EE1016),
+        # leaving meta_dev uninitialized -> the AIV kv_exchange kernel would
+        # dereference garbage meta -> vector core exception 507035. Refuse to
+        # launch inside a capture window instead of crashing the stream.
+        if getattr(torch.npu, "is_current_stream_capturing", bool)():
+            if direction == TransferDirection.D2H:
+                logger.warning(
+                    "[aclrt_aiv] D2H backup skipped: thread is in a graph "
+                    "capture window (GLOBAL mode would break the meta upload)"
+                )
+                return
+            raise RuntimeError(
+                "H2D load requested inside a graph capture window "
+                f"(dir={direction} layer_id={layer_id}); refusing to launch "
+                "kv_exchange with a potentially broken meta upload"
+            )
         # TEMP-LOG: verify the dispatch actually reaches the aclrt_aiv path.
         logger.info(
             "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
             direction, layer_id, index_k_layer_id,
         )
-        # TEMP-LOG: production pool geometry for the pitch/layer-range audit.
+        # TEMP-EXP1: index max values vs pool page counts -- any idx.max()
+        # >= its pool page count is a hard out-of-bounds for the AIV kernel
+        # (dev pool pages = dev_k.shape[1], host pool pages = host_k.shape[0]).
         logger.info(
             "[aclrt_aiv] geom dev_k=%s(stride=%s) host_k=%s(stride=%s) "
-            "dev_idx=%s host_idx=%s ps=%s",
+            "dev_idx=%s(max=%s of %s) host_idx=%s(max=%s of %s) ps=%s",
             tuple(buffers.k.shape), tuple(buffers.k.stride()),
             tuple(self.k_buffer.shape), tuple(self.k_buffer.stride()),
-            tuple(device_indices.shape), tuple(host_indices.shape),
+            tuple(device_indices.shape),
+            device_indices.max().item() if device_indices.numel() else -1,
+            buffers.k.shape[1],
+            tuple(host_indices.shape),
+            host_indices.max().item() if host_indices.numel() else -1,
+            self.k_buffer.shape[0],
             self.page_size,
         )
         if self.index_k_buffer is not None and buffers.index_k is not None:
