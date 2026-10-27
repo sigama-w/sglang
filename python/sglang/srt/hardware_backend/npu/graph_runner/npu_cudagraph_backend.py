@@ -130,6 +130,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 pool=self._pool,
                 stream=self._capture_stream,
                 auto_dispatch_capture=True,
+                capture_error_mode="relaxed",
             ),
         ):
             out = forward_fn()
