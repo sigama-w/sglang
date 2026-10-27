@@ -73,7 +73,9 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                     stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.npu.graph(npugraph, pool=self.graph_pool):
+                with torch.npu.graph(
+                    npugraph, pool=self.graph_pool, capture_error_mode="relaxed"
+                ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:

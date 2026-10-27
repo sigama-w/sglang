@@ -181,6 +181,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 pool=pool,
                 stream=stream,
                 auto_dispatch_capture=True,
+                capture_error_mode="relaxed",
             ),
         ):
             out = run_once_fn()
