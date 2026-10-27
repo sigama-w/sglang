@@ -745,6 +745,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             "[aclrt_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
             direction, layer_id, index_k_layer_id,
         )
+        # Unit conversion (ROOT CAUSE of the 507035 vector core exceptions):
+        # the transfer interface hands out page-aligned TOKEN slot indices
+        # (cf. the ascendc path's `index // page_size` and dim_exchange's
+        # page_size parameter), while the kv_exchange kernel contract expects
+        # per-token PAGE indices. Passing a token id (e.g. 2943) straight
+        # through made the AIV kernel dereference it as a page number ->
+        # offset far outside the pool -> invalid GM address.
+        host_indices = host_indices // self.page_size
+        device_indices = device_indices // self.page_size
         # TEMP-EXP1: index max values vs pool page counts -- any idx.max()
         # >= its pool page count is a hard out-of-bounds for the AIV kernel
         # (dev pool pages = dev_k.shape[1], host pool pages = host_k.shape[0]).
