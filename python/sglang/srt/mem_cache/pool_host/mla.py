@@ -532,6 +532,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         index_k_layer_id: int = -1,
     ) -> None:
         """Transfer registered MF host blocks with the AIV kv_exchange ops."""
+        logger.info(
+            "[mf_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
+            direction,
+            layer_id,
+            index_k_layer_id,
+        )
         kvcacheio = _get_mf_aiv_kvcacheio()
         host_k, host_v, host_index_k, host_index_k_scale = host_buffers
         device = buffers.k.device
