@@ -14,6 +14,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
 )
 from sglang.srt.mem_cache.pool_host import common as host_common
+from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
+from sglang.srt.mem_cache.pool_host import npu_memfabric
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_register,
@@ -521,6 +523,190 @@ class TestHiCacheHostRegister(unittest.TestCase):
             self.assertIs(ALLOC_MEMORY_FUNCS[device], alloc_with_pin_memory)
         # CUDA and ROCm ("cuda") keep the cudaHostRegister default.
         self.assertIs(ALLOC_MEMORY_FUNCS.default_factory(), alloc_with_host_register)
+
+
+class TestMFAIVHostMemory(unittest.TestCase):
+    @staticmethod
+    def _api(name):
+        value = getattr(npu_memfabric, name, None)
+        if value is None:
+            raise AssertionError(f"missing MF+AIV API: {name}")
+        return value
+
+    def _fresh_state(self, kvcacheio=None):
+        state = getattr(npu_memfabric, "_mf_aiv_state", None)
+        if state is None:
+            raise AssertionError("missing independent MF+AIV state")
+        return mock.patch.dict(
+            state,
+            {
+                "kvcacheio": kvcacheio,
+                "initialized": False,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+                "device_id": None,
+            },
+            clear=True,
+        )
+
+    @staticmethod
+    def _mla_host():
+        host = mla_pool_host.MLATokenToKVPoolHost.__new__(
+            mla_pool_host.MLATokenToKVPoolHost
+        )
+        host.layout = "page_first_kv_split"
+        host.page_num = 4
+        host.layer_num = 3
+        host.page_size = 16
+        host.dtype = torch.bfloat16
+        host.kv_lora_rank = 5
+        host.qk_rope_head_dim = 3
+        host.dsa_kv_cache_store_fp8 = False
+        host._transfer_device = SimpleNamespace(type="npu")
+        host.device = "cpu"
+        host.pin_memory = True
+        host.allocator = None
+        host._native_buffers = SimpleNamespace(
+            k_width=5,
+            index_layer_indices=[0, 2],
+            index_k=object(),
+            index_scales=object(),
+            index_width=7,
+        )
+        return host
+
+    def test_backend_is_explicit_and_rejects_legacy_memfabric_combination(self):
+        enabled = self._api("mf_aiv_backend_enabled")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(enabled())
+        with mock.patch.dict(
+            os.environ, {"SGLANG_HICACHE_NPU_BACKEND": "mf_aiv"}, clear=True
+        ):
+            self.assertTrue(enabled())
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_HICACHE_NPU_BACKEND": "mf_aiv",
+                "SGLANG_HICACHE_HOST_MEM_BACKEND": "memfabric",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                enabled()
+
+    def test_capacity_aligns_each_component_and_checks_device_and_reserve(self):
+        gib = 1024**3
+        kvcacheio = mock.Mock()
+        ensure = self._api("ensure_mf_aiv_capacity")
+        with self._fresh_state(kvcacheio):
+            ensure([gib + 1, 2 * gib + 1, 1], 2)
+            kvcacheio.initialize_host_memory.assert_called_once_with(2, 6 * gib)
+            ensure([1], 2)
+            kvcacheio.initialize_host_memory.assert_called_once()
+            with self.assertRaisesRegex(RuntimeError, "device"):
+                ensure([1], 3)
+            with self.assertRaisesRegex(RuntimeError, "exhausted"):
+                ensure([6 * gib + 1], 2)
+
+    def test_allocator_registers_every_component_and_tracks_aligned_usage(self):
+        gib = 1024**3
+        kvcacheio = mock.Mock()
+        kvcacheio.empty_host_memory.side_effect = (
+            lambda shape, dtype: torch.empty(shape, dtype=dtype)
+        )
+        alloc = self._api("alloc_with_mf_aiv")
+        with self._fresh_state(kvcacheio) as state:
+            state.update(initialized=True, reserved_bytes=4 * gib, device_id=0)
+            buffers = [
+                alloc(
+                    dims=(2, 3),
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    pin_memory=True,
+                    allocator=None,
+                )
+                for _ in range(4)
+            ]
+            self.assertEqual(kvcacheio.empty_host_memory.call_count, 4)
+            self.assertEqual(kvcacheio.register_host_memory.call_count, 4)
+            for buffer, call in zip(
+                buffers, kvcacheio.register_host_memory.call_args_list, strict=True
+            ):
+                self.assertIs(call.args[0], buffer)
+            self.assertEqual(state["allocated_bytes"], 4 * gib)
+
+    def test_registration_failure_does_not_uninitialize_global_mf(self):
+        kvcacheio = mock.Mock()
+        kvcacheio.empty_host_memory.return_value = torch.empty(2, dtype=torch.bfloat16)
+        kvcacheio.register_host_memory.side_effect = RuntimeError("injected")
+        alloc = self._api("alloc_with_mf_aiv")
+        with self._fresh_state(kvcacheio) as state:
+            state.update(initialized=True, reserved_bytes=1024**3, device_id=0)
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                alloc(
+                    dims=(2,),
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    pin_memory=True,
+                    allocator=None,
+                )
+            kvcacheio.uninitialize_host_memory.assert_not_called()
+
+    def test_mla_mf_aiv_allocates_and_registers_all_present_components(self):
+        host = self._mla_host()
+        ensure = mock.Mock()
+        alloc = mock.Mock(
+            side_effect=lambda dims, dtype, **kwargs: torch.empty(dims, dtype=dtype)
+        )
+        default_alloc = mock.Mock()
+        legacy_alloc = mock.Mock()
+        base = host.page_num * host.layer_num * host.page_size
+        index_base = host.page_num * 2 * host.page_size
+        itemsize = host.dtype.itemsize
+        expected_sizes = [
+            base * host.kv_lora_rank * itemsize,
+            base * host.qk_rope_head_dim * itemsize,
+            index_base * host._native_buffers.index_width * itemsize,
+            index_base * 4,
+        ]
+        with (
+            mock.patch.object(mla_pool_host, "_is_npu", True),
+            mock.patch.object(
+                mla_pool_host, "mf_aiv_backend_enabled", return_value=True, create=True
+            ),
+            mock.patch.object(
+                mla_pool_host, "memfabric_host_memory_enabled", return_value=False
+            ),
+            mock.patch.object(
+                mla_pool_host, "ensure_mf_aiv_capacity", ensure, create=True
+            ),
+            mock.patch.object(
+                mla_pool_host, "alloc_with_mf_aiv", alloc, create=True
+            ),
+            mock.patch.object(
+                mla_pool_host, "alloc_with_memfabric", legacy_alloc
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mla.torch.npu",
+                SimpleNamespace(current_device=mock.Mock(return_value=2)),
+                create=True,
+            ),
+            mock.patch.dict(ALLOC_MEMORY_FUNCS, {"npu": default_alloc}),
+        ):
+            host.init_kv_buffer()
+        ensure.assert_called_once_with(expected_sizes, 2)
+        self.assertEqual(alloc.call_count, 4)
+        default_alloc.assert_not_called()
+        legacy_alloc.assert_not_called()
+
+    def test_pool_destroy_does_not_uninitialize_global_mf(self):
+        host = self._mla_host()
+        host._destroyed = False
+        host.kv_buffer = None
+        kvcacheio = mock.Mock()
+        with self._fresh_state(kvcacheio):
+            host.destroy()
+        kvcacheio.uninitialize_host_memory.assert_not_called()
 
 
 if __name__ == "__main__":

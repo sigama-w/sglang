@@ -26,6 +26,13 @@ _memfabric_state = {
     "allocated_bytes": 0,
     "device_id": None,
 }
+_mf_aiv_state = {
+    "kvcacheio": None,
+    "initialized": False,
+    "reserved_bytes": 0,
+    "allocated_bytes": 0,
+    "device_id": None,
+}
 
 
 def memfabric_host_memory_enabled() -> bool:
@@ -33,6 +40,17 @@ def memfabric_host_memory_enabled() -> bool:
     return os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND", "").lower() == (
         "memfabric"
     )
+
+
+def mf_aiv_backend_enabled() -> bool:
+    """Enable MF host-memory registration plus the AIV kv_exchange ops."""
+    enabled = os.environ.get("SGLANG_HICACHE_NPU_BACKEND", "").lower() == "mf_aiv"
+    if enabled and memfabric_host_memory_enabled():
+        raise ValueError(
+            "SGLANG_HICACHE_NPU_BACKEND=mf_aiv cannot be combined with "
+            "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric"
+        )
+    return enabled
 
 
 def ascendc_io_enabled() -> bool:
@@ -117,6 +135,76 @@ def alloc_with_memfabric(
         numel *= d
     tensor = offload.empty(list(dims), dtype=dtype)
     _memfabric_state["allocated_bytes"] += numel * dtype.itemsize
+    return tensor
+
+
+def _get_mf_aiv_kvcacheio():
+    if _mf_aiv_state["kvcacheio"] is None:
+        try:
+            from sgl_kernel_npu import kvcacheio
+        except ImportError as exc:
+            raise ImportError(
+                "SGLANG_HICACHE_NPU_BACKEND=mf_aiv requires an "
+                "sgl-kernel-npu build with MF host-memory and AIV kv_exchange support"
+            ) from exc
+        _mf_aiv_state["kvcacheio"] = kvcacheio
+    return _mf_aiv_state["kvcacheio"]
+
+
+def _mf_aiv_aligned_bytes(nbytes: int) -> int:
+    return ((nbytes + _MEMFABRIC_GB - 1) // _MEMFABRIC_GB) * _MEMFABRIC_GB
+
+
+def ensure_mf_aiv_capacity(component_nbytes, device_id: int) -> None:
+    """Initialize and account for MF host memory using per-block GB alignment."""
+    required_bytes = sum(_mf_aiv_aligned_bytes(nbytes) for nbytes in component_nbytes)
+    kvcacheio = _get_mf_aiv_kvcacheio()
+    if not _mf_aiv_state["initialized"]:
+        kvcacheio.initialize_host_memory(device_id, required_bytes)
+        _mf_aiv_state.update(
+            initialized=True, reserved_bytes=required_bytes, device_id=device_id
+        )
+        logger.info(
+            "[HiCache] MF+AIV host memory initialized: reserve=%.2fGB device=%d",
+            required_bytes / _MEMFABRIC_GB,
+            device_id,
+        )
+    elif _mf_aiv_state["device_id"] != device_id:
+        raise RuntimeError(
+            f"MF+AIV host memory is already initialized for device "
+            f"{_mf_aiv_state['device_id']}, got device {device_id}"
+        )
+
+    remaining = _mf_aiv_state["reserved_bytes"] - _mf_aiv_state["allocated_bytes"]
+    if required_bytes > remaining:
+        raise RuntimeError(
+            f"MF+AIV host memory exhausted: need {required_bytes / _MEMFABRIC_GB:.2f}GB "
+            f"after per-component alignment, only {remaining / _MEMFABRIC_GB:.2f}GB "
+            "left; runtime reserve growth is not supported"
+        )
+
+
+def alloc_with_mf_aiv(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+) -> torch.Tensor:
+    """Allocate and register one MF host block for automatic DVA resolution."""
+    if not _mf_aiv_state["initialized"]:
+        raise RuntimeError("ensure_mf_aiv_capacity must run before MF+AIV allocation")
+    numel = 1
+    for dim in dims:
+        numel *= dim
+    aligned_bytes = _mf_aiv_aligned_bytes(numel * dtype.itemsize)
+    remaining = _mf_aiv_state["reserved_bytes"] - _mf_aiv_state["allocated_bytes"]
+    if aligned_bytes > remaining:
+        raise RuntimeError("MF+AIV host memory exhausted during component allocation")
+    kvcacheio = _get_mf_aiv_kvcacheio()
+    tensor = kvcacheio.empty_host_memory(dims, dtype=dtype)
+    kvcacheio.register_host_memory(tensor)
+    _mf_aiv_state["allocated_bytes"] += aligned_bytes
     return tensor
 
 

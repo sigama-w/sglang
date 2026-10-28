@@ -964,12 +964,13 @@ class HiCacheController:
         elif self.io_backend == "kernel_ascend":
             from sglang.srt.mem_cache.pool_host.npu_memfabric import (
                 ascendc_io_enabled,
+                mf_aiv_backend_enabled,
                 to_device_no_sync,
             )
 
-            if ascendc_io_enabled():
-                # The fused acc_offload kv_exchange kernel reads the token
-                # indices directly on the device; keeping them there avoids
+            if mf_aiv_backend_enabled() or ascendc_io_enabled():
+                # The AIV kv_exchange kernels read the token indices directly
+                # on the device; keeping them there avoids
                 # the D2H sync that would serialize the layer-group pipeline.
                 # (The legacy memcpy2d exchange op still wants CPU indices and
                 # converts them itself.)

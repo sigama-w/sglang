@@ -1429,6 +1429,376 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(captured["host_indices"].device.type, "cpu")
 
 
+class TestMFAIVTransfer(CustomTestCase):
+    @staticmethod
+    def _npu_index():
+        index = mock.Mock()
+        index.device = SimpleNamespace(type="npu")
+        index.record_stream = mock.Mock()
+        return index
+
+    @staticmethod
+    def _direct_host():
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.page_size = 128
+        host.k_buffer = torch.empty(1)
+        host.v_buffer = torch.empty(1)
+        host.index_k_buffer = torch.empty(1)
+        host.index_k_scale_buffer = torch.empty(4, 1, 2, 1, 1)
+        return host
+
+    @staticmethod
+    def _sliced_host():
+        target = SimpleNamespace(
+            k=torch.empty(2, 4, 2, 1, 3),
+            v=torch.empty(2, 4, 2, 1, 2),
+            index_k=torch.empty(1, 4, 2, 1, 3),
+            index_scales=torch.empty(1, 4, 2, 1),
+            index_layer_indices=[0],
+        )
+        draft = SimpleNamespace(
+            k=torch.empty(1, 4, 2, 1, 3),
+            v=torch.empty(1, 4, 2, 1, 2),
+            index_k=None,
+            index_scales=None,
+            index_layer_indices=[],
+        )
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host._is_dummy = False
+        host._layer_shard_enabled = False
+        host._target_layer_indices = (0, 1)
+        host._host_layer_by_controller = {0: 0, 1: 1, 2: 2}
+        host._device_layer_num = 2
+        host._native_infos = tuple(
+            SimpleNamespace(
+                native_buffers=mock.Mock(
+                    side_effect=lambda native=native: SimpleNamespace(
+                        k=native.k,
+                        v=native.v,
+                        index_k=native.index_k,
+                        index_scales=native.index_scales,
+                        index_layer_indices=native.index_layer_indices,
+                    )
+                )
+            )
+            for native in (target, draft)
+        )
+        host.layout = "page_first_kv_split"
+        host.page_size = 2
+        host.dcp_size = 1
+        host.dcp_rank = 0
+        host.k_buffer = torch.empty(4, 3, 2, 1, 3)
+        host.v_buffer = torch.empty(4, 3, 2, 1, 2)
+        host.index_k_buffer = torch.empty(4, 1, 2, 1, 3)
+        host.index_k_scale_buffer = torch.empty(4, 1, 2, 1, 1)
+        return host, target, draft
+
+    def test_direct_transfer_preserves_indices_direction_and_index_layers(self):
+        host = self._direct_host()
+        native = SimpleNamespace(
+            k=torch.empty(1),
+            v=torch.empty(1),
+            index_k=torch.empty(1),
+            index_scales=torch.empty(1, 4, 2, 1),
+        )
+        host_buffers = (
+            host.k_buffer,
+            host.v_buffer,
+            host.index_k_buffer,
+            host.index_k_scale_buffer,
+        )
+        host_indices = torch.tensor([1, 129, 257], dtype=torch.int64)
+        device_indices = torch.tensor([3, 130, 259], dtype=torch.int64)
+        npu_host_indices = self._npu_index()
+        npu_device_indices = self._npu_index()
+        upload = mock.Mock(side_effect=[npu_host_indices, npu_device_indices])
+        kvcacheio = mock.Mock()
+        stream = object()
+        transfer = getattr(host, "_transfer_mf_aiv", None)
+        self.assertIsNotNone(transfer, "missing MLA MF+AIV transfer helper")
+        with (
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
+                SimpleNamespace(H2D="H2D", D2H="D2H"),
+                create=True,
+            ),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}._get_mf_aiv_kvcacheio",
+                return_value=kvcacheio,
+                create=True,
+            ),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.to_device_no_sync", upload),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.torch.npu",
+                SimpleNamespace(current_stream=mock.Mock(return_value=stream)),
+                create=True,
+            ),
+        ):
+            transfer(
+                native,
+                host_buffers,
+                host_indices,
+                device_indices,
+                "H2D",
+                layer_id=1,
+                index_k_layer_id=0,
+            )
+            h2d_calls = kvcacheio.transfer_kv_per_layer_direct_pf_lf.call_args_list
+            self.assertEqual(len(h2d_calls), 2)
+            self.assertEqual(h2d_calls[0].kwargs["src_ptrs"], [host.k_buffer, host.v_buffer])
+            self.assertEqual(h2d_calls[0].kwargs["dst_ptrs"], [native.k, native.v])
+            self.assertIs(h2d_calls[0].kwargs["src_indices"], npu_host_indices)
+            self.assertIs(h2d_calls[0].kwargs["dst_indices"], npu_device_indices)
+            self.assertEqual(h2d_calls[0].kwargs["layer_id"], 1)
+            self.assertEqual(h2d_calls[1].kwargs["layer_id"], 0)
+            self.assertEqual(
+                h2d_calls[1].kwargs["dst_ptrs"][1].shape,
+                host.index_k_scale_buffer.shape,
+            )
+            for call in h2d_calls:
+                self.assertNotIn("host_mappings", call.kwargs)
+
+            upload.reset_mock()
+            upload.side_effect = [npu_host_indices, npu_device_indices]
+            kvcacheio.reset_mock()
+            transfer(native, host_buffers, host_indices, device_indices, "D2H")
+            d2h_calls = kvcacheio.transfer_kv_all_layer_direct_lf_pf.call_args_list
+            self.assertEqual(len(d2h_calls), 2)
+            self.assertEqual(d2h_calls[0].kwargs["src_ptrs"], [native.k, native.v])
+            self.assertEqual(d2h_calls[0].kwargs["dst_ptrs"], [host.k_buffer, host.v_buffer])
+            self.assertIs(d2h_calls[0].kwargs["src_indices"], npu_device_indices)
+            self.assertIs(d2h_calls[0].kwargs["dst_indices"], npu_host_indices)
+            self.assertEqual(
+                d2h_calls[1].kwargs["src_ptrs"][1].shape,
+                host.index_k_scale_buffer.shape,
+            )
+            for call in d2h_calls:
+                self.assertNotIn("host_mappings", call.kwargs)
+
+        self.assertIs(upload.call_args_list[0].args[0], host_indices)
+        self.assertEqual(host_indices.tolist(), [1, 129, 257])
+        npu_host_indices.record_stream.assert_called_with(stream)
+        npu_device_indices.record_stream.assert_called_with(stream)
+
+    def test_direct_transfer_skips_empty_v(self):
+        host = self._direct_host()
+        host.index_k_buffer = None
+        host.index_k_scale_buffer = None
+        native = SimpleNamespace(
+            k=torch.empty(1), v=torch.empty(0), index_k=None, index_scales=None
+        )
+        host.v_buffer = torch.empty(0)
+        host_indices = self._npu_index()
+        device_indices = self._npu_index()
+        kvcacheio = mock.Mock()
+        transfer = getattr(host, "_transfer_mf_aiv", None)
+        self.assertIsNotNone(transfer)
+        with (
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
+                SimpleNamespace(H2D="H2D"),
+                create=True,
+            ),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}._get_mf_aiv_kvcacheio",
+                return_value=kvcacheio,
+                create=True,
+            ),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.torch.npu",
+                SimpleNamespace(current_stream=mock.Mock(return_value=object())),
+                create=True,
+            ),
+        ):
+            transfer(
+                native,
+                (host.k_buffer, host.v_buffer, None, None),
+                host_indices,
+                device_indices,
+                "H2D",
+                layer_id=0,
+            )
+        call = kvcacheio.transfer_kv_per_layer_direct_pf_lf.call_args
+        self.assertEqual(call.kwargs["src_ptrs"], [host.k_buffer])
+        self.assertEqual(call.kwargs["dst_ptrs"], [native.k])
+
+    def test_dispatch_uses_target_and_draft_host_slices(self):
+        host, target, draft = self._sliced_host()
+        transfer = mock.Mock()
+        legacy = mock.Mock()
+        dim_exchange = mock.Mock()
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 4], dtype=torch.int64)
+        with (
+            mock.patch(f"{MLA_POOL_HOST_MODULE}._is_npu", True),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.mf_aiv_backend_enabled", return_value=True),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.ascendc_io_enabled", return_value=False),
+            mock.patch.object(host, "_transfer_mf_aiv", transfer, create=True),
+            mock.patch.object(host, "_transfer_ascendc_sparse_copy", legacy),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.transfer_kv_dim_exchange", dim_exchange, create=True),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
+                SimpleNamespace(H2D="H2D", D2H="D2H"),
+                create=True,
+            ),
+        ):
+            host.load_to_device_per_layer(
+                object(), host_indices, device_indices, 0, "kernel_ascend"
+            )
+            host.load_to_device_per_layer(
+                object(), host_indices, device_indices, 2, "kernel_ascend", is_draft=True
+            )
+            self.assertEqual(transfer.call_count, 2)
+            target_call, draft_call = transfer.call_args_list
+            self.assertIs(target_call.args[0].k, target.k)
+            self.assertEqual(target_call.args[1][0].shape[1], 2)
+            self.assertEqual(target_call.kwargs["layer_id"], 0)
+            self.assertEqual(target_call.kwargs["index_k_layer_id"], 0)
+            self.assertIs(draft_call.args[0].k, draft.k)
+            self.assertEqual(draft_call.args[1][0].shape[1], 1)
+            self.assertIsNone(draft_call.args[1][2])
+            self.assertIsNone(draft_call.args[1][3])
+
+            transfer.reset_mock()
+            host.backup_from_device_all_layer(
+                object(), host_indices, device_indices, "kernel_ascend"
+            )
+            self.assertEqual(transfer.call_count, 2)
+            self.assertIs(transfer.call_args_list[0].args[0].k, target.k)
+            self.assertIs(transfer.call_args_list[1].args[0].k, draft.k)
+            self.assertEqual(transfer.call_args_list[0].args[1][0].shape[1], 2)
+            self.assertEqual(transfer.call_args_list[1].args[1][0].shape[1], 1)
+
+        legacy.assert_not_called()
+        dim_exchange.assert_not_called()
+
+    def test_default_and_legacy_ascendc_dispatch_are_unchanged(self):
+        host, _, _ = self._sliced_host()
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 4], dtype=torch.int64)
+        with (
+            mock.patch(f"{MLA_POOL_HOST_MODULE}._is_npu", True),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.mf_aiv_backend_enabled", return_value=False),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.ascendc_io_enabled", return_value=False),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.transfer_kv_dim_exchange", create=True
+            ) as dim_exchange,
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
+                SimpleNamespace(H2D="H2D", D2H="D2H"),
+                create=True,
+            ),
+        ):
+            host.load_to_device_per_layer(
+                object(), host_indices, device_indices, 0, "kernel_ascend"
+            )
+            host.load_to_device_per_layer(
+                object(), host_indices, device_indices, 1, "kernel_ascend"
+            )
+            host.backup_from_device_all_layer(
+                object(), host_indices, device_indices, "kernel_ascend"
+            )
+            self.assertEqual(dim_exchange.call_count, 4)
+
+        legacy = mock.Mock()
+        with (
+            mock.patch(f"{MLA_POOL_HOST_MODULE}._is_npu", True),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.mf_aiv_backend_enabled", return_value=False),
+            mock.patch(f"{MLA_POOL_HOST_MODULE}.ascendc_io_enabled", return_value=True),
+            mock.patch.object(host, "_transfer_ascendc_sparse_copy", legacy),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.transfer_kv_dim_exchange", create=True
+            ) as dim_exchange,
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
+                SimpleNamespace(H2D="H2D", D2H="D2H"),
+                create=True,
+            ),
+        ):
+            host.load_to_device_per_layer(
+                object(), host_indices, device_indices, 0, "kernel_ascend"
+            )
+            host.backup_from_device_all_layer(
+                object(), host_indices, device_indices, "kernel_ascend"
+            )
+            self.assertEqual(legacy.call_count, 2)
+            dim_exchange.assert_not_called()
+
+    def test_move_indices_keeps_mf_aiv_indices_on_npu(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.io_backend = "kernel_ascend"
+        controller.device = SimpleNamespace(type="npu")
+        host_indices = torch.tensor([1, 129], dtype=torch.int64)
+        npu_host_indices = self._npu_index()
+        device_indices = self._npu_index()
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.mf_aiv_backend_enabled",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.ascendc_io_enabled",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.to_device_no_sync",
+                return_value=npu_host_indices,
+            ) as upload,
+        ):
+            actual_host, actual_device = controller.move_indices(
+                host_indices, device_indices
+            )
+        self.assertIs(actual_host, npu_host_indices)
+        self.assertIs(actual_device, device_indices)
+        upload.assert_called_once_with(host_indices, controller.device)
+
+    def test_move_indices_default_and_legacy_behavior_is_unchanged(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.io_backend = "kernel_ascend"
+        controller.device = SimpleNamespace(type="npu")
+        host_indices = torch.tensor([1, 129], dtype=torch.int64)
+        device_indices = self._npu_index()
+        cpu_device_indices = self._npu_index()
+        device_indices.cpu = mock.Mock(return_value=cpu_device_indices)
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.mf_aiv_backend_enabled",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.ascendc_io_enabled",
+                return_value=False,
+            ),
+        ):
+            actual_host, actual_device = controller.move_indices(
+                host_indices, device_indices
+            )
+        self.assertIs(actual_host, host_indices)
+        self.assertIs(actual_device, cpu_device_indices)
+
+        npu_host_indices = self._npu_index()
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.mf_aiv_backend_enabled",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.ascendc_io_enabled",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.npu_memfabric.to_device_no_sync",
+                return_value=npu_host_indices,
+            ),
+        ):
+            actual_host, actual_device = controller.move_indices(
+                host_indices, device_indices
+            )
+        self.assertIs(actual_host, npu_host_indices)
+        self.assertIs(actual_device, device_indices)
+        device_indices.cpu.assert_called_once_with()
+
+
 class _IndexTensorStub:
     """Stands in for an index tensor resident on ``device_type``; CPU CI has no xpu."""
 
