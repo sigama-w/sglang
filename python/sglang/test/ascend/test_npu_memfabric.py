@@ -1,7 +1,7 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 
-import pytest
-
+from sglang.srt.mem_cache import l2_transfer
 from sglang.srt.mem_cache.pool_host import npu_memfabric
 
 
@@ -31,123 +31,56 @@ class _FakeNPU:
         self.events.append("reset_stream_limit")
 
 
-def _make_pool(events, *, consumer_index=0, num_layers=3):
-    counter = SimpleNamespace(
-        consumer_index=consumer_index,
-        num_layers=num_layers,
-        wait_until=lambda layer_id: events.append(("wait_until", layer_id)),
-    )
-    return SimpleNamespace(start_layer=8, layer_transfer_counter=counter)
-
-
-def _enable_a5_memfabric(monkeypatch):
+def _enable_memfabric(monkeypatch, *, is_a5):
     monkeypatch.setenv("SGLANG_HICACHE_HOST_MEM_BACKEND", "memfabric")
+    from sglang.srt.hardware_backend.npu import utils as npu_utils
+
+    monkeypatch.setattr(npu_utils, "is_npu_arch35", lambda: is_a5)
+
+
+def test_a5_stream_limit_reserves_last_two_aivs(monkeypatch):
+    events = []
+    _enable_memfabric(monkeypatch, is_a5=True)
     monkeypatch.setattr(
-        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35", lambda: True
+        npu_memfabric.torch, "npu", _FakeNPU(events), raising=False
     )
 
-
-def test_attention_overlap_reserves_aiv_and_waits_for_next_layer(monkeypatch):
-    events = []
-    fake_npu = _FakeNPU(events)
-    pool = _make_pool(events)
-    _enable_a5_memfabric(monkeypatch)
-    monkeypatch.setattr(npu_memfabric.torch, "npu", fake_npu, raising=False)
-
-    with npu_memfabric.memfabric_h2d_attention_overlap(pool) as counter:
-        events.append("attention")
-    events.append("prefetch_next_full_attention")
-    npu_memfabric.wait_for_next_h2d_layer(pool, layer_id=8, counter=counter)
+    npu_memfabric.set_memfabric_h2d_stream_limit()
+    npu_memfabric.reset_memfabric_h2d_stream_limit(
+        SimpleNamespace(consumer_index=0)
+    )
 
     assert events == [
         "current_stream",
         ("set_stream_limit", 31, 62),
-        "attention",
+        "current_stream",
         "reset_stream_limit",
-        "prefetch_next_full_attention",
-        ("wait_until", 1),
     ]
 
 
-def test_attention_overlap_does_not_wait_past_last_layer(monkeypatch):
+def test_a3_stream_limit_reserves_last_two_aivs(monkeypatch):
     events = []
-    pool = _make_pool(events)
-    _enable_a5_memfabric(monkeypatch)
+    _enable_memfabric(monkeypatch, is_a5=False)
     monkeypatch.setattr(
         npu_memfabric.torch, "npu", _FakeNPU(events), raising=False
     )
 
-    with npu_memfabric.memfabric_h2d_attention_overlap(pool) as counter:
-        events.append("attention")
-    npu_memfabric.wait_for_next_h2d_layer(pool, layer_id=10, counter=counter)
-
-    assert not any(
-        isinstance(event, tuple) and event[0] == "wait_until" for event in events
+    npu_memfabric.set_memfabric_h2d_stream_limit()
+    npu_memfabric.reset_memfabric_h2d_stream_limit(
+        SimpleNamespace(consumer_index=0)
     )
-
-
-def test_attention_overlap_restores_stream_on_attention_error(monkeypatch):
-    events = []
-    pool = _make_pool(events)
-    _enable_a5_memfabric(monkeypatch)
-    monkeypatch.setattr(
-        npu_memfabric.torch, "npu", _FakeNPU(events), raising=False
-    )
-
-    with pytest.raises(RuntimeError, match="attention failed"):
-        with npu_memfabric.memfabric_h2d_attention_overlap(pool):
-            raise RuntimeError("attention failed")
-
-    assert events[-1] == "reset_stream_limit"
-    assert not any(
-        isinstance(event, tuple) and event[0] == "wait_until" for event in events
-    )
-
-
-@pytest.mark.parametrize("consumer_index", [-1, 0])
-def test_attention_overlap_is_noop_when_disabled(monkeypatch, consumer_index):
-    events = []
-    pool = _make_pool(events, consumer_index=consumer_index)
-    monkeypatch.setattr(
-        npu_memfabric.torch, "npu", _FakeNPU(events), raising=False
-    )
-    if consumer_index == -1:
-        _enable_a5_memfabric(monkeypatch)
-    else:
-        monkeypatch.delenv("SGLANG_HICACHE_HOST_MEM_BACKEND", raising=False)
-
-    with npu_memfabric.memfabric_h2d_attention_overlap(pool):
-        events.append("attention")
-
-    assert events == ["attention"]
-
-
-def test_attention_overlap_reserves_aiv_on_a3(monkeypatch):
-    events = []
-    pool = _make_pool(events)
-    monkeypatch.setenv("SGLANG_HICACHE_HOST_MEM_BACKEND", "memfabric")
-    monkeypatch.setattr(
-        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35", lambda: False
-    )
-    monkeypatch.setattr(
-        npu_memfabric.torch, "npu", _FakeNPU(events), raising=False
-    )
-
-    with npu_memfabric.memfabric_h2d_attention_overlap(pool):
-        events.append("attention")
 
     assert events == [
         "current_stream",
         ("set_stream_limit", 23, 46),
-        "attention",
+        "current_stream",
         "reset_stream_limit",
     ]
 
 
-def test_attention_overlap_skips_runtime_stream_capture(monkeypatch):
+def test_stream_limit_skips_runtime_capture(monkeypatch):
     events = []
-    pool = _make_pool(events)
-    _enable_a5_memfabric(monkeypatch)
+    _enable_memfabric(monkeypatch, is_a5=False)
     monkeypatch.setattr(
         npu_memfabric.torch,
         "npu",
@@ -155,8 +88,74 @@ def test_attention_overlap_skips_runtime_stream_capture(monkeypatch):
         raising=False,
     )
 
-    with npu_memfabric.memfabric_h2d_attention_overlap(pool) as counter:
-        assert counter is None
-        events.append("attention")
+    npu_memfabric.set_memfabric_h2d_stream_limit()
+    npu_memfabric.reset_memfabric_h2d_stream_limit(
+        SimpleNamespace(consumer_index=0)
+    )
 
-    assert events == ["current_stream", "attention"]
+    assert events == ["current_stream", "current_stream"]
+
+
+def test_stream_limit_is_noop_without_memfabric(monkeypatch):
+    events = []
+    monkeypatch.delenv("SGLANG_HICACHE_HOST_MEM_BACKEND", raising=False)
+    monkeypatch.setattr(
+        npu_memfabric.torch, "npu", _FakeNPU(events), raising=False
+    )
+
+    npu_memfabric.set_memfabric_h2d_stream_limit()
+    npu_memfabric.reset_memfabric_h2d_stream_limit(
+        SimpleNamespace(consumer_index=0)
+    )
+
+    assert events == []
+
+
+def test_on_demand_submission_finishes_only_after_last_layer(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        l2_transfer.device_module, "stream", lambda stream: nullcontext()
+    )
+
+    class FakeEvent:
+        def record(self):
+            events.append("finish")
+
+    class FakeDomain:
+        def release_layout(self, event, key):
+            events.append(("release", event))
+
+    finish_event = FakeEvent()
+    engine = SimpleNamespace(
+        _submit_h2d_layer=lambda transfers, layer_id: events.append(
+            ("layer", layer_id)
+        ),
+        _record_stream=lambda transfers, stream: events.append("record_stream"),
+    )
+    submission = l2_transfer.OnDemandH2DSubmission(
+        engine=engine,
+        original_transfers=[object()],
+        transfers=[object()],
+        stream=object(),
+        completion=SimpleNamespace(finish_event=finish_event),
+        domains=[FakeDomain()],
+        transfer_layer_id_max=2,
+        on_layer_done=lambda layer_id: events.append(("done", layer_id)),
+    )
+
+    submission.submit_next()
+    assert not submission.finished
+    assert events == [("layer", 0), ("done", 0)]
+
+    submission.submit_next()
+    submission.submit_next()
+    assert submission.finished
+    assert events == [
+        ("layer", 0),
+        ("done", 0),
+        ("layer", 1),
+        ("done", 1),
+        "finish",
+        "record_stream",
+        ("release", finish_event),
+    ]

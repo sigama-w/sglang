@@ -2348,6 +2348,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
         if counter is not None and counter.consumer_index >= 0:
+            drain_prefetch = getattr(counter, "drain_prefetch", None)
+            if drain_prefetch is not None:
+                drain_prefetch()
             counter.wait_until(counter.num_layers - 1)
 
     def execute(

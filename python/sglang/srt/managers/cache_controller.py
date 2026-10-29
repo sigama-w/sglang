@@ -94,6 +94,8 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self.on_layer_consumed = None
+        self.on_prefetch_drain = None
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -105,7 +107,22 @@ class LayerDoneCounter:
     def set_consumer(self, index: int):
         self.consumer_index = index
 
+    def consume_layer(self, layer_id: int):
+        if self.consumer_index < 0 or self.on_layer_consumed is None:
+            return
+        if layer_id + 1 < self.num_layers:
+            self.on_layer_consumed(layer_id)
+
+    def drain_prefetch(self):
+        if self.consumer_index >= 0 and self.on_prefetch_drain is not None:
+            self.on_prefetch_drain()
+
     def wait_until(self, threshold: int):
+        if self.consumer_index < 0:
+            return
+        self.events[self.consumer_index].wait(threshold)
+
+    def wait_for_prefetch(self, threshold: int):
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
@@ -113,6 +130,8 @@ class LayerDoneCounter:
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self.on_layer_consumed = None
+        self.on_prefetch_drain = None
 
 
 class CacheOperation:
@@ -383,6 +402,7 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        self._on_demand_loads = {}
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -1121,7 +1141,7 @@ class HiCacheController:
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
-    def start_loading(self) -> int:
+    def start_loading(self, on_demand: bool = True) -> int:
         if len(self.load_queue) == 0:
             return -1
 
@@ -1140,12 +1160,42 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
-        completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
-            start_event=producer_event.start_event,
-            on_layer_done=producer_event.complete,
-            transfer_layer_id_max=self.transfer_layer_id_max,
+        transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
         )
+        use_on_demand = (
+            on_demand
+            and self.io_backend == "kernel_ascend"
+            and getattr(self.mem_pool_device, "supports_on_demand_h2d", False)
+        )
+        if use_on_demand:
+            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+                ascendc_io_enabled,
+            )
+
+            use_on_demand = ascendc_io_enabled()
+
+        if use_on_demand:
+            submission = self.l2_transfer_engine.start_host_to_device_on_demand(
+                transfers,
+                start_event=producer_event.start_event,
+                on_layer_done=producer_event.complete,
+                transfer_layer_id_max=self.transfer_layer_id_max,
+            )
+            if not submission.finished:
+                self._on_demand_loads[producer_id] = submission
+            self.layer_done_counter.on_layer_consumed = self.trigger_layer_load
+            self.layer_done_counter.on_prefetch_drain = self.finish_layer_load
+            completion = submission.completion
+        else:
+            self.layer_done_counter.on_layer_consumed = None
+            self.layer_done_counter.on_prefetch_drain = None
+            completion = self.l2_transfer_engine.submit_host_to_device(
+                transfers,
+                start_event=producer_event.start_event,
+                on_layer_done=producer_event.complete,
+                transfer_layer_id_max=self.transfer_layer_id_max,
+            )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event
@@ -1163,6 +1213,34 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def trigger_layer_load(self, layer_id: int):
+        submission = self._on_demand_loads.get(
+            self.layer_done_counter.consumer_index
+        )
+        if submission is None or submission.next_layer_id != layer_id + 1:
+            return
+
+        from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+            set_memfabric_h2d_stream_limit,
+        )
+
+        self.l2_transfer_engine.host_to_device_stream.wait_stream(
+            device_module.current_stream()
+        )
+        set_memfabric_h2d_stream_limit()
+        submission.submit_next()
+        if submission.finished:
+            self._on_demand_loads.pop(self.layer_done_counter.consumer_index, None)
+
+    def finish_layer_load(self):
+        consumer_index = self.layer_done_counter.consumer_index
+        submission = self._on_demand_loads.get(consumer_index)
+        if submission is None:
+            return
+        while not submission.finished:
+            submission.submit_next()
+        self._on_demand_loads.pop(consumer_index, None)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:

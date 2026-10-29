@@ -160,8 +160,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
-    memfabric_h2d_attention_overlap,
-    wait_for_next_h2d_layer,
+    memfabric_h2d_overlap_enabled,
+    reset_memfabric_h2d_stream_limit,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1726,6 +1726,21 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
+        h2d_overlap_pool = (
+            get_token_to_kv_pool()
+            if _is_npu and not get_is_capture_mode()
+            else None
+        )
+        h2d_counter = getattr(h2d_overlap_pool, "layer_transfer_counter", None)
+        reset_memfabric_h2d_stream_limit(h2d_counter)
+        if memfabric_h2d_overlap_enabled(h2d_counter):
+            next_layer_id = self.layer_id - h2d_overlap_pool.start_layer + 1
+            if next_layer_id < h2d_counter.num_layers:
+                wait_for_prefetch = getattr(
+                    h2d_counter, "wait_for_prefetch", h2d_counter.wait_until
+                )
+                wait_for_prefetch(next_layer_id)
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -2839,12 +2854,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             if _is_npu and not get_is_capture_mode()
             else None
         )
-        h2d_overlap_ctx = (
-            memfabric_h2d_attention_overlap(h2d_overlap_pool)
-            if h2d_overlap_pool is not None
-            else nullcontext()
-        )
-        with h2d_overlap_ctx as h2d_counter:
+        h2d_counter = getattr(h2d_overlap_pool, "layer_transfer_counter", None)
+        try:
             with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
                 hidden_states = self.self_attn(
                     positions=positions,
@@ -2855,6 +2866,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                     input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
                     prev_topk_indices=prev_topk_indices,
                 )
+        finally:
+            if not self.is_layer_sparse:
+                reset_memfabric_h2d_stream_limit(h2d_counter)
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -2864,7 +2878,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
-        wait_for_next_h2d_layer(h2d_overlap_pool, self.layer_id, h2d_counter)
+        if not self.is_layer_sparse and memfabric_h2d_overlap_enabled(h2d_counter):
+            next_layer_id = self.layer_id - h2d_overlap_pool.start_layer + 1
+            if next_layer_id < h2d_counter.num_layers:
+                wait_for_prefetch = getattr(
+                    h2d_counter, "wait_for_prefetch", h2d_counter.wait_until
+                )
+                wait_for_prefetch(next_layer_id)
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)

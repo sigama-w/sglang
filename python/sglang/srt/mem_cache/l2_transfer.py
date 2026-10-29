@@ -52,6 +52,67 @@ class TransferCompletion(NamedTuple):
     timing_enabled: bool
 
 
+class OnDemandH2DSubmission:
+    """A prepared H2D transfer submitted one layer at a time by the consumer."""
+
+    def __init__(
+        self,
+        engine,
+        original_transfers,
+        transfers,
+        stream,
+        completion,
+        domains,
+        transfer_layer_id_max,
+        on_layer_done,
+    ):
+        self.engine = engine
+        self.original_transfers = original_transfers
+        self.transfers = transfers
+        self.stream = stream
+        self.completion = completion
+        self.domains = domains
+        self.transfer_layer_id_max = transfer_layer_id_max
+        self.on_layer_done = on_layer_done
+        self.next_layer_id = 0
+        self.finished = False
+
+    def submit_next(self):
+        if self.finished:
+            return
+        layer_id = self.next_layer_id
+        try:
+            with device_module.stream(self.stream):
+                self.engine._submit_h2d_layer(self.transfers, layer_id)
+                if self.on_layer_done is not None:
+                    self.on_layer_done(layer_id)
+            self.next_layer_id += 1
+            if self.next_layer_id == self.transfer_layer_id_max:
+                self._finish()
+        except Exception:
+            self.stream.synchronize()
+            self.finished = True
+            self._release(None)
+            raise
+
+    def _finish(self):
+        with device_module.stream(self.stream):
+            self.completion.finish_event.record()
+            self.engine._record_stream(
+                self.original_transfers + self.transfers, self.stream
+            )
+        self.finished = True
+        self._release(self.completion.finish_event)
+
+    def _release(self, finish_event):
+        for domain in reversed(self.domains):
+            domain.release_layout(
+                finish_event,
+                (id(self.engine), "host_to_device"),
+            )
+        self.domains = []
+
+
 class L2TransferEngine:
     """Runs resolved device↔host transfers without owning cache state."""
 
@@ -172,6 +233,32 @@ class L2TransferEngine:
                 )
         return completion
 
+    def _submit_h2d_layer(self, transfers, layer_id):
+        primary = transfers[0] if transfers else None
+        delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
+        if delay_cycles:
+            torch.cuda._sleep(delay_cycles)
+        for transfer in transfers:
+            local_layer_id = (
+                transfer.layer_mapper(layer_id)
+                if transfer.layer_mapper is not None
+                else layer_id
+            )
+            if local_layer_id is None or (
+                transfer is not primary
+                and transfer.layer_mapper is None
+                and layer_id >= transfer.host_pool.layer_num
+            ):
+                continue
+            transfer.host_pool.load_to_device_per_layer_physical(
+                transfer.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                local_layer_id,
+                self.io_backend,
+                is_draft=transfer.is_draft,
+            )
+
     def submit_host_to_device(
         self,
         transfers: list[L2Transfer],
@@ -189,34 +276,57 @@ class L2TransferEngine:
             transfers,
             completion,
         ):
-            primary = transfers[0] if transfers else None
-            delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):
-                if delay_cycles:
-                    torch.cuda._sleep(delay_cycles)
-                for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
+                self._submit_h2d_layer(transfers, layer_id)
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion
+
+    def start_host_to_device_on_demand(
+        self,
+        transfers: list[L2Transfer],
+        *,
+        transfer_layer_id_max: int,
+        start_event=None,
+        on_layer_done=None,
+    ) -> OnDemandH2DSubmission:
+        assert not self._h2d_on_current_stream
+        stream = self.host_to_device_stream
+        start_event = self._start_event(start_event)
+        ack_start, ack_finish, timing_enabled = make_timing_event_pair()
+        completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
+        original_transfers = transfers
+        domains = list(shared_host_layout_domains(t.host_pool for t in transfers))
+        for domain in domains:
+            domain.acquire_layout()
+        try:
+            with device_module.stream(self.index_stream):
+                start_event.wait(self.index_stream)
+                prepared = self._prepare_transfers(transfers)
+                prepared_event = device_module.Event()
+                prepared_event.record()
+            with device_module.stream(stream):
+                prepared_event.wait(stream)
+                ack_start.record()
+        except Exception:
+            self.index_stream.synchronize()
+            stream.synchronize()
+            for domain in reversed(domains):
+                domain.release_layout(None, (id(self), "host_to_device"))
+            raise
+
+        submission = OnDemandH2DSubmission(
+            self,
+            original_transfers,
+            prepared,
+            stream,
+            completion,
+            domains,
+            transfer_layer_id_max,
+            on_layer_done,
+        )
+        submission.submit_next()
+        return submission
 
     @staticmethod
     def _start_event(start_event):

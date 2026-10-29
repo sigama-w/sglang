@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import contextmanager
 
 import torch
 
@@ -47,40 +46,42 @@ def ascendc_io_enabled() -> bool:
     return memfabric_host_memory_enabled()
 
 
-@contextmanager
-def memfabric_h2d_attention_overlap(kv_pool):
-    counter = getattr(kv_pool, "layer_transfer_counter", None)
-    if counter is None or counter.consumer_index < 0 or not ascendc_io_enabled():
-        yield None
+def memfabric_h2d_overlap_enabled(counter) -> bool:
+    return (
+        counter is not None
+        and counter.consumer_index >= 0
+        and ascendc_io_enabled()
+    )
+
+
+def _npu_stream_is_capturing(stream) -> bool:
+    stream_is_capturing = getattr(stream, "is_capturing", None)
+    npu_is_capturing = getattr(torch.npu, "is_current_stream_capturing", None)
+    return (
+        callable(stream_is_capturing) and stream_is_capturing()
+    ) or (callable(npu_is_capturing) and npu_is_capturing())
+
+
+def set_memfabric_h2d_stream_limit() -> None:
+    if not ascendc_io_enabled():
+        return
+    stream = torch.npu.current_stream()
+    if _npu_stream_is_capturing(stream):
         return
 
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-    stream = torch.npu.current_stream()
-    stream_is_capturing = getattr(stream, "is_capturing", None)
-    npu_is_capturing = getattr(torch.npu, "is_current_stream_capturing", None)
-    if (
-        callable(stream_is_capturing) and stream_is_capturing()
-    ) or (callable(npu_is_capturing) and npu_is_capturing()):
-        # Python capture 标志无法覆盖 Runtime 的 GLOBAL capture 状态。
-        yield None
-        return
-
     # acc_offload 在 A5/A3 分别启动 64/48 个 AIV，并只使用最后两个。
     cube_num, vector_num = (31, 62) if is_npu_arch35() else (23, 46)
     torch.npu.set_stream_limit(stream, cube_num=cube_num, vector_num=vector_num)
-    try:
-        yield counter
-    finally:
-        torch.npu.reset_stream_limit(stream)
 
 
-def wait_for_next_h2d_layer(kv_pool, layer_id: int, counter) -> None:
-    if counter is None:
+def reset_memfabric_h2d_stream_limit(counter) -> None:
+    if not memfabric_h2d_overlap_enabled(counter):
         return
-    next_layer_id = layer_id - kv_pool.start_layer + 1
-    if next_layer_id < counter.num_layers:
-        counter.wait_until(next_layer_id)
+    stream = torch.npu.current_stream()
+    if not _npu_stream_is_capturing(stream):
+        torch.npu.reset_stream_limit(stream)
 
 
 def _get_memfabric_offload():

@@ -315,7 +315,9 @@ class DecodeHiCacheTransferMixin:
             return
 
         counter = self.tree_cache.cache_controller.layer_done_counter
-        consumer_index = self.tree_cache.ready_to_load_host_cache()
+        consumer_index = self.tree_cache.cache_controller.start_loading(
+            on_demand=False
+        )
         if consumer_index < 0:
             # No new copy: earlier copies on the load stream still protect L1 hits.
             consumer_index = counter.producer_index

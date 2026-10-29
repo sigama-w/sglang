@@ -627,6 +627,8 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
+    supports_on_demand_h2d = True
+
     def __init__(
         self,
         size: int,
@@ -866,6 +868,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            consume_layer = getattr(
+                self.layer_transfer_counter, "consume_layer", None
+            )
+            if consume_layer is not None:
+                consume_layer(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
         return (
             self.k_buffer[layer_id - self.start_layer],
@@ -886,6 +893,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            consume_layer = getattr(
+                self.layer_transfer_counter, "consume_layer", None
+            )
+            if consume_layer is not None:
+                consume_layer(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
         if self.store_dtype != self.dtype:
@@ -895,6 +907,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            consume_layer = getattr(
+                self.layer_transfer_counter, "consume_layer", None
+            )
+            if consume_layer is not None:
+                consume_layer(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
         if self.store_dtype != self.dtype:
