@@ -159,13 +159,20 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+    memfabric_h2d_attention_overlap,
+    wait_for_next_h2d_layer,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -2827,7 +2834,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_format=self._resolve_gfx95_quant_format(),
         )
 
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+        h2d_overlap_pool = (
+            get_token_to_kv_pool()
+            if _is_npu and not get_is_capture_mode()
+            else None
+        )
+        h2d_overlap_ctx = (
+            memfabric_h2d_attention_overlap(h2d_overlap_pool)
+            if h2d_overlap_pool is not None
+            else nullcontext()
+        )
+        with (
+            h2d_overlap_ctx,
+            self.self_attn.maybe_use_decode_attn_tp(forward_batch),
+        ) as (h2d_counter, _):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -2846,6 +2866,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
+        wait_for_next_h2d_layer(h2d_overlap_pool, self.layer_id, h2d_counter)
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)

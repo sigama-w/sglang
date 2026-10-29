@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 
 import torch
 
@@ -44,6 +45,33 @@ def ascendc_io_enabled() -> bool:
     Memfabric-mapped memory).
     """
     return memfabric_host_memory_enabled()
+
+
+@contextmanager
+def memfabric_h2d_attention_overlap(kv_pool):
+    counter = getattr(kv_pool, "layer_transfer_counter", None)
+    if counter is None or counter.consumer_index < 0 or not ascendc_io_enabled():
+        yield None
+        return
+
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    # acc_offload 在 A5/A3 分别启动 64/48 个 AIV，并只使用最后两个。
+    cube_num, vector_num = (31, 62) if is_npu_arch35() else (23, 46)
+    stream = torch.npu.current_stream()
+    torch.npu.set_stream_limit(stream, cube_num=cube_num, vector_num=vector_num)
+    try:
+        yield counter
+    finally:
+        torch.npu.reset_stream_limit(stream)
+
+
+def wait_for_next_h2d_layer(kv_pool, layer_id: int, counter) -> None:
+    if counter is None:
+        return
+    next_layer_id = layer_id - kv_pool.start_layer + 1
+    if next_layer_id < counter.num_layers:
+        counter.wait_until(next_layer_id)
 
 
 def _get_memfabric_offload():
