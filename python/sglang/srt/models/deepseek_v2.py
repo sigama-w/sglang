@@ -2844,19 +2844,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             if h2d_overlap_pool is not None
             else nullcontext()
         )
-        with (
-            h2d_overlap_ctx,
-            self.self_attn.maybe_use_decode_attn_tp(forward_batch),
-        ) as (h2d_counter, _):
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
-                llama_4_scaling=llama_4_scaling,
-                input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
-                prev_topk_indices=prev_topk_indices,
-            )
+        with h2d_overlap_ctx as h2d_counter:
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    zero_allocator=zero_allocator,
+                    llama_4_scaling=llama_4_scaling,
+                    input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
+                    prev_topk_indices=prev_topk_indices,
+                )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
