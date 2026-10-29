@@ -1046,7 +1046,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         from torch.distributed import get_rank
         if get_rank() == 0:
             print(
-                f"[mla-io] H2D enter backend={io_backend} layout={self.layout} "
+                f"[mla-io] D2H enter backend={io_backend} layout={self.layout} "
                 f"ascendc={ascendc_io_enabled()}",
                 flush=True,
             )
