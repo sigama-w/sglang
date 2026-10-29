@@ -56,9 +56,18 @@ def memfabric_h2d_attention_overlap(kv_pool):
 
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
+    stream = torch.npu.current_stream()
+    stream_is_capturing = getattr(stream, "is_capturing", None)
+    npu_is_capturing = getattr(torch.npu, "is_current_stream_capturing", None)
+    if (
+        callable(stream_is_capturing) and stream_is_capturing()
+    ) or (callable(npu_is_capturing) and npu_is_capturing()):
+        # Python capture 标志无法覆盖 Runtime 的 GLOBAL capture 状态。
+        yield None
+        return
+
     # acc_offload 在 A5/A3 分别启动 64/48 个 AIV，并只使用最后两个。
     cube_num, vector_num = (31, 62) if is_npu_arch35() else (23, 46)
-    stream = torch.npu.current_stream()
     torch.npu.set_stream_limit(stream, cube_num=cube_num, vector_num=vector_num)
     try:
         yield counter

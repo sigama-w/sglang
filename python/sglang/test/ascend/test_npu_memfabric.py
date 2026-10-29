@@ -5,10 +5,18 @@ import pytest
 from sglang.srt.mem_cache.pool_host import npu_memfabric
 
 
+class _FakeStream:
+    def __init__(self, capturing=False):
+        self.capturing = capturing
+
+    def is_capturing(self):
+        return self.capturing
+
+
 class _FakeNPU:
-    def __init__(self, events):
+    def __init__(self, events, *, capturing=False):
         self.events = events
-        self.stream = object()
+        self.stream = _FakeStream(capturing)
 
     def current_stream(self):
         self.events.append("current_stream")
@@ -134,3 +142,21 @@ def test_attention_overlap_reserves_aiv_on_a3(monkeypatch):
         "attention",
         "reset_stream_limit",
     ]
+
+
+def test_attention_overlap_skips_runtime_stream_capture(monkeypatch):
+    events = []
+    pool = _make_pool(events)
+    _enable_a5_memfabric(monkeypatch)
+    monkeypatch.setattr(
+        npu_memfabric.torch,
+        "npu",
+        _FakeNPU(events, capturing=True),
+        raising=False,
+    )
+
+    with npu_memfabric.memfabric_h2d_attention_overlap(pool) as counter:
+        assert counter is None
+        events.append("attention")
+
+    assert events == ["current_stream", "attention"]
