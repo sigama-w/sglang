@@ -10,6 +10,12 @@ from unittest import mock
 
 import torch
 
+# These fixtures drive start_loading/loading_check without a model forward, so
+# no layer is ever consumed and the on-demand per-layer H2D pipeline (whose
+# ack only records once the last layer is triggered or drained) would stall.
+# Fall back to the bulk all-layer submission.
+os.environ.setdefault("SGLANG_HICACHE_ON_DEMAND_H2D", "0")
+
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCachePreallocMixin
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,

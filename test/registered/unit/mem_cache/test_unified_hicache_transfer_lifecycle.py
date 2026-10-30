@@ -23,12 +23,19 @@ for `torch.cuda.current_stream()` rather than executed.
 
 import atexit
 import contextlib
+import os
 import unittest
 from array import array
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
+
+# These fixtures assert loaded KV contents right after start_loading +
+# loading_check, with no model forward to consume layers. The on-demand
+# per-layer H2D pipeline only records its ack once the last layer is
+# triggered or drained, so fall back to the bulk all-layer submission.
+os.environ.setdefault("SGLANG_HICACHE_ON_DEMAND_H2D", "0")
 
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
