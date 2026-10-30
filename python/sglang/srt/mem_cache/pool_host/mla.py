@@ -35,7 +35,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
-    _get_mf_aiv_kvcacheio,
+    _get_mf_aiv_kv_exchange,
     alloc_with_memfabric,
     alloc_with_mf_aiv,
     ascendc_io_enabled,
@@ -520,89 +520,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 return slot, 1
         return 0, 0
 
-    def _transfer_mf_aiv(
-        self,
-        buffers,
-        host_buffers,
-        host_indices,
-        device_indices,
-        direction: TransferDirection,
-        *,
-        layer_id: int = -1,
-        index_k_layer_id: int = -1,
-    ) -> None:
-        """Transfer registered MF host blocks with the AIV kv_exchange ops."""
-        logger.info(
-            "[mf_aiv] transfer dir=%s layer_id=%s index_k_layer_id=%s",
-            direction,
-            layer_id,
-            index_k_layer_id,
-        )
-        kvcacheio = _get_mf_aiv_kvcacheio()
-        host_k, host_v, host_index_k, host_index_k_scale = host_buffers
-        device = buffers.k.device
-        if host_indices.device.type != "npu":
-            host_indices = to_device_no_sync(host_indices, device)
-        if device_indices.device.type != "npu":
-            device_indices = to_device_no_sync(device_indices, device)
-        stream = torch.npu.current_stream()
-        host_indices.record_stream(stream)
-        device_indices.record_stream(stream)
-
-        per_layer = direction == TransferDirection.H2D
-        if per_layer:
-            assert layer_id >= 0, "H2D per-layer transfer requires layer_id"
-
-        dev_bufs = [buffers.k]
-        host_bufs = [host_k]
-        if buffers.v.numel() > 0 and host_v.numel() > 0:
-            dev_bufs.append(buffers.v)
-            host_bufs.append(host_v)
-        if per_layer:
-            kvcacheio.transfer_kv_per_layer_direct_pf_lf(
-                src_ptrs=host_bufs,
-                dst_ptrs=dev_bufs,
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                layer_id=layer_id,
-                page_size=self.page_size,
-            )
-        else:
-            kvcacheio.transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=dev_bufs,
-                dst_ptrs=host_bufs,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
-            )
-
-        if host_index_k is None or buffers.index_k is None:
-            return
-        if per_layer and index_k_layer_id < 0:
-            return
-        ik_dev = [buffers.index_k]
-        ik_host = [host_index_k]
-        if host_index_k_scale is not None and buffers.index_scales is not None:
-            ik_dev.append(buffers.index_scales.unsqueeze(-1))
-            ik_host.append(host_index_k_scale)
-        if per_layer:
-            kvcacheio.transfer_kv_per_layer_direct_pf_lf(
-                src_ptrs=ik_host,
-                dst_ptrs=ik_dev,
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                layer_id=index_k_layer_id,
-                page_size=self.page_size,
-            )
-        else:
-            kvcacheio.transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=ik_dev,
-                dst_ptrs=ik_host,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                page_size=self.page_size,
-            )
-
     def _transfer_ascendc_sparse_copy(
         self,
         buffers,
@@ -902,26 +819,32 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device_layer_id = 0 if is_draft else layer_id
             if self.layout == "page_first_kv_split":
                 if _is_npu and mf_aiv_backend_enabled():
-                    pool_slice = next(
-                        (
-                            pool_slice
-                            for pool_slice in self._npu_transfer_pool_slices()
-                            if pool_slice[0].k is native.k
-                        ),
-                        None,
-                    )
-                    if pool_slice is None:
-                        return
+                    # One merged operator call per layer: full host pool
+                    # components plus explicit layer ids; the C++ adapter
+                    # folds the layer offsets into the base addresses.
                     ik_start, ik_num = self._indexer_slot_range_for_layer(
                         native, device_layer_id
                     )
-                    self._transfer_mf_aiv(
-                        native,
-                        pool_slice[1:],
-                        host_indices,
-                        device_indices,
-                        TransferDirection.H2D,
+                    has_index_k = native.index_k is not None
+                    has_scales = native.index_scales is not None
+                    _get_mf_aiv_kv_exchange().transfer_kv_per_layer_kv_split_pf_lf(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=native.k,
+                        host_k=self.k_buffer,
+                        device_v=native.v,
+                        host_v=self.v_buffer,
+                        device_index_k=native.index_k if has_index_k else None,
+                        host_index_k=self.index_k_buffer if has_index_k else None,
+                        device_index_k_scale=(
+                            native.index_scales if has_scales else None
+                        ),
+                        host_index_k_scale=(
+                            self.index_k_scale_buffer if has_scales else None
+                        ),
+                        page_size=self.page_size,
                         layer_id=device_layer_id,
+                        host_layer_id=host_layer_id,
                         index_k_layer_id=ik_start if ik_num == 1 else -1,
                     )
                     return
@@ -1245,14 +1168,42 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             native = self._native_infos[0].native_buffers()
             if self.layout == "page_first_kv_split":
                 if _is_npu and mf_aiv_backend_enabled():
-                    for pool_slice in self._npu_transfer_pool_slices():
-                        self._transfer_mf_aiv(
-                            pool_slice[0],
-                            pool_slice[1:],
-                            host_indices,
-                            device_indices,
-                            TransferDirection.D2H,
+                    # One merged operator call per device pool: full host pool
+                    # components plus the pool's host_layer_start; the C++
+                    # adapter folds the layer offsets into the base addresses.
+                    # Pool compatibility policy stays here in the framework.
+                    kv_split = _get_mf_aiv_kv_exchange()
+                    host_layer_start = 0
+                    for i, info in enumerate(self._native_infos):
+                        native = info.native_buffers()
+                        is_target = i == 0
+                        if not is_target:
+                            if native.index_k is not None:
+                                self._warn_draft_indexer_skipped(native)
+                            if not self._npu_draft_pool_compatible(native):
+                                host_layer_start += native.k.shape[0]
+                                continue
+                        has_index_k = is_target and native.index_k is not None
+                        has_scales = is_target and native.index_scales is not None
+                        kv_split.transfer_kv_all_layer_kv_split_lf_pf(
+                            device_indices=device_indices,
+                            host_indices=host_indices,
+                            device_k=native.k,
+                            host_k=self.k_buffer,
+                            device_v=native.v,
+                            host_v=self.v_buffer,
+                            device_index_k=native.index_k if has_index_k else None,
+                            host_index_k=self.index_k_buffer if has_index_k else None,
+                            device_index_k_scale=(
+                                native.index_scales if has_scales else None
+                            ),
+                            host_index_k_scale=(
+                                self.index_k_scale_buffer if has_scales else None
+                            ),
+                            page_size=self.page_size,
+                            host_layer_start=host_layer_start,
                         )
+                        host_layer_start += native.k.shape[0]
                     return
                 if _is_npu and ascendc_io_enabled():
                     self._transfer_ascendc_sparse_copy(

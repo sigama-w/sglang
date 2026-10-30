@@ -1438,16 +1438,6 @@ class TestMFAIVTransfer(CustomTestCase):
         return index
 
     @staticmethod
-    def _direct_host():
-        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
-        host.page_size = 128
-        host.k_buffer = torch.empty(1)
-        host.v_buffer = torch.empty(1)
-        host.index_k_buffer = torch.empty(1)
-        host.index_k_scale_buffer = torch.empty(4, 1, 2, 1, 1)
-        return host
-
-    @staticmethod
     def _sliced_host():
         target = SimpleNamespace(
             k=torch.empty(2, 4, 2, 1, 3),
@@ -1493,181 +1483,176 @@ class TestMFAIVTransfer(CustomTestCase):
         host.index_k_scale_buffer = torch.empty(4, 1, 2, 1, 1)
         return host, target, draft
 
-    def test_direct_transfer_preserves_indices_direction_and_index_layers(self):
-        host = self._direct_host()
-        native = SimpleNamespace(
-            k=torch.empty(1),
-            v=torch.empty(1),
-            index_k=torch.empty(1),
-            index_scales=torch.empty(1, 4, 2, 1),
-        )
-        host_buffers = (
-            host.k_buffer,
-            host.v_buffer,
-            host.index_k_buffer,
-            host.index_k_scale_buffer,
-        )
-        host_indices = torch.tensor([1, 129, 257], dtype=torch.int64)
-        device_indices = torch.tensor([3, 130, 259], dtype=torch.int64)
-        npu_host_indices = self._npu_index()
-        npu_device_indices = self._npu_index()
-        upload = mock.Mock(side_effect=[npu_host_indices, npu_device_indices])
-        kvcacheio = mock.Mock()
-        stream = object()
-        transfer = getattr(host, "_transfer_mf_aiv", None)
-        self.assertIsNotNone(transfer, "missing MLA MF+AIV transfer helper")
-        with (
-            mock.patch(
-                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
-                SimpleNamespace(H2D="H2D", D2H="D2H"),
-                create=True,
-            ),
-            mock.patch(
-                f"{MLA_POOL_HOST_MODULE}._get_mf_aiv_kvcacheio",
-                return_value=kvcacheio,
-                create=True,
-            ),
-            mock.patch(f"{MLA_POOL_HOST_MODULE}.to_device_no_sync", upload),
-            mock.patch(
-                f"{MLA_POOL_HOST_MODULE}.torch.npu",
-                SimpleNamespace(current_stream=mock.Mock(return_value=stream)),
-                create=True,
-            ),
-        ):
-            transfer(
-                native,
-                host_buffers,
-                host_indices,
-                device_indices,
-                "H2D",
-                layer_id=1,
-                index_k_layer_id=0,
-            )
-            h2d_calls = kvcacheio.transfer_kv_per_layer_direct_pf_lf.call_args_list
-            self.assertEqual(len(h2d_calls), 2)
-            self.assertEqual(h2d_calls[0].kwargs["src_ptrs"], [host.k_buffer, host.v_buffer])
-            self.assertEqual(h2d_calls[0].kwargs["dst_ptrs"], [native.k, native.v])
-            self.assertIs(h2d_calls[0].kwargs["src_indices"], npu_host_indices)
-            self.assertIs(h2d_calls[0].kwargs["dst_indices"], npu_device_indices)
-            self.assertEqual(h2d_calls[0].kwargs["layer_id"], 1)
-            self.assertEqual(h2d_calls[1].kwargs["layer_id"], 0)
-            self.assertEqual(
-                h2d_calls[1].kwargs["dst_ptrs"][1].shape,
-                host.index_k_scale_buffer.shape,
-            )
-            for call in h2d_calls:
-                self.assertNotIn("host_mappings", call.kwargs)
+    @contextmanager
+    def _mf_aiv_dispatch(self, host, kv_split):
+        """Route kernel_ascend IO to the MF+AIV kv_exchange operators.
 
-            upload.reset_mock()
-            upload.side_effect = [npu_host_indices, npu_device_indices]
-            kvcacheio.reset_mock()
-            transfer(native, host_buffers, host_indices, device_indices, "D2H")
-            d2h_calls = kvcacheio.transfer_kv_all_layer_direct_lf_pf.call_args_list
-            self.assertEqual(len(d2h_calls), 2)
-            self.assertEqual(d2h_calls[0].kwargs["src_ptrs"], [native.k, native.v])
-            self.assertEqual(d2h_calls[0].kwargs["dst_ptrs"], [host.k_buffer, host.v_buffer])
-            self.assertIs(d2h_calls[0].kwargs["src_indices"], npu_device_indices)
-            self.assertIs(d2h_calls[0].kwargs["dst_indices"], npu_host_indices)
-            self.assertEqual(
-                d2h_calls[1].kwargs["src_ptrs"][1].shape,
-                host.index_k_scale_buffer.shape,
-            )
-            for call in d2h_calls:
-                self.assertNotIn("host_mappings", call.kwargs)
-
-        self.assertIs(upload.call_args_list[0].args[0], host_indices)
-        self.assertEqual(host_indices.tolist(), [1, 129, 257])
-        npu_host_indices.record_stream.assert_called_with(stream)
-        npu_device_indices.record_stream.assert_called_with(stream)
-
-    def test_direct_transfer_skips_empty_v(self):
-        host = self._direct_host()
-        host.index_k_buffer = None
-        host.index_k_scale_buffer = None
-        native = SimpleNamespace(
-            k=torch.empty(1), v=torch.empty(0), index_k=None, index_scales=None
-        )
-        host.v_buffer = torch.empty(0)
-        host_indices = self._npu_index()
-        device_indices = self._npu_index()
-        kvcacheio = mock.Mock()
-        transfer = getattr(host, "_transfer_mf_aiv", None)
-        self.assertIsNotNone(transfer)
-        with (
-            mock.patch(
-                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
-                SimpleNamespace(H2D="H2D"),
-                create=True,
-            ),
-            mock.patch(
-                f"{MLA_POOL_HOST_MODULE}._get_mf_aiv_kvcacheio",
-                return_value=kvcacheio,
-                create=True,
-            ),
-            mock.patch(
-                f"{MLA_POOL_HOST_MODULE}.torch.npu",
-                SimpleNamespace(current_stream=mock.Mock(return_value=object())),
-                create=True,
-            ),
-        ):
-            transfer(
-                native,
-                (host.k_buffer, host.v_buffer, None, None),
-                host_indices,
-                device_indices,
-                "H2D",
-                layer_id=0,
-            )
-        call = kvcacheio.transfer_kv_per_layer_direct_pf_lf.call_args
-        self.assertEqual(call.kwargs["src_ptrs"], [host.k_buffer])
-        self.assertEqual(call.kwargs["dst_ptrs"], [native.k])
-
-    def test_dispatch_uses_target_and_draft_host_slices(self):
-        host, target, draft = self._sliced_host()
-        transfer = mock.Mock()
+        Patches the NPU flag, the backend switch and the lazy operator
+        loader; yields the (legacy_sparse_copy, dim_exchange) mocks that must
+        stay untouched while the new interface owns the transfer.
+        """
         legacy = mock.Mock()
         dim_exchange = mock.Mock()
-        host_indices = torch.tensor([1, 3], dtype=torch.int64)
-        device_indices = torch.tensor([2, 4], dtype=torch.int64)
         with (
             mock.patch(f"{MLA_POOL_HOST_MODULE}._is_npu", True),
-            mock.patch(f"{MLA_POOL_HOST_MODULE}.mf_aiv_backend_enabled", return_value=True),
-            mock.patch(f"{MLA_POOL_HOST_MODULE}.ascendc_io_enabled", return_value=False),
-            mock.patch.object(host, "_transfer_mf_aiv", transfer, create=True),
-            mock.patch.object(host, "_transfer_ascendc_sparse_copy", legacy),
-            mock.patch(f"{MLA_POOL_HOST_MODULE}.transfer_kv_dim_exchange", dim_exchange, create=True),
             mock.patch(
-                f"{MLA_POOL_HOST_MODULE}.TransferDirection",
-                SimpleNamespace(H2D="H2D", D2H="D2H"),
+                f"{MLA_POOL_HOST_MODULE}.mf_aiv_backend_enabled", return_value=True
+            ),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.ascendc_io_enabled", return_value=False
+            ),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}._get_mf_aiv_kv_exchange",
+                return_value=kv_split,
+            ),
+            mock.patch.object(host, "_transfer_ascendc_sparse_copy", legacy),
+            mock.patch(
+                f"{MLA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
+                dim_exchange,
                 create=True,
             ),
         ):
+            yield legacy, dim_exchange
+
+    def test_transfer_mf_aiv_helper_is_removed(self):
+        self.assertIsNone(
+            getattr(MLATokenToKVPoolHost, "_transfer_mf_aiv", None),
+            "_transfer_mf_aiv must be removed from MLATokenToKVPoolHost",
+        )
+        host, _, _ = self._sliced_host()
+        self.assertIsNone(getattr(host, "_transfer_mf_aiv", None))
+
+    def test_per_layer_h2d_passes_full_host_buffers_and_layer_offsets(self):
+        host, target, draft = self._sliced_host()
+        kv_split = mock.Mock()
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 4], dtype=torch.int64)
+        with self._mf_aiv_dispatch(host, kv_split) as (legacy, dim_exchange):
             host.load_to_device_per_layer(
                 object(), host_indices, device_indices, 0, "kernel_ascend"
             )
             host.load_to_device_per_layer(
+                object(), host_indices, device_indices, 1, "kernel_ascend"
+            )
+            host.load_to_device_per_layer(
                 object(), host_indices, device_indices, 2, "kernel_ascend", is_draft=True
             )
-            self.assertEqual(transfer.call_count, 2)
-            target_call, draft_call = transfer.call_args_list
-            self.assertIs(target_call.args[0].k, target.k)
-            self.assertEqual(target_call.args[1][0].shape[1], 2)
-            self.assertEqual(target_call.kwargs["layer_id"], 0)
-            self.assertEqual(target_call.kwargs["index_k_layer_id"], 0)
-            self.assertIs(draft_call.args[0].k, draft.k)
-            self.assertEqual(draft_call.args[1][0].shape[1], 1)
-            self.assertIsNone(draft_call.args[1][2])
-            self.assertIsNone(draft_call.args[1][3])
 
-            transfer.reset_mock()
+        op = kv_split.transfer_kv_per_layer_kv_split_pf_lf
+        self.assertEqual(op.call_count, 3)
+        layer0, layer1, draft_call = op.call_args_list
+        # Target layer 0 (indexer hit): exactly one merged operator call with
+        # the FULL host pool buffers, raw indices and 4-D scales passed
+        # through; layer folding lives in the operator, not the framework.
+        self.assertIs(layer0.kwargs["device_k"], target.k)
+        self.assertIs(layer0.kwargs["host_k"], host.k_buffer)
+        self.assertIs(layer0.kwargs["device_v"], target.v)
+        self.assertIs(layer0.kwargs["host_v"], host.v_buffer)
+        self.assertIs(layer0.kwargs["device_index_k"], target.index_k)
+        self.assertIs(layer0.kwargs["host_index_k"], host.index_k_buffer)
+        self.assertIs(layer0.kwargs["device_index_k_scale"], target.index_scales)
+        self.assertIs(layer0.kwargs["host_index_k_scale"], host.index_k_scale_buffer)
+        self.assertEqual(target.index_scales.dim(), 4)
+        self.assertEqual(host.index_k_scale_buffer.dim(), 4)
+        self.assertIs(layer0.kwargs["host_indices"], host_indices)
+        self.assertIs(layer0.kwargs["device_indices"], device_indices)
+        self.assertEqual(layer0.kwargs["page_size"], host.page_size)
+        self.assertEqual(layer0.kwargs["layer_id"], 0)
+        self.assertEqual(layer0.kwargs["host_layer_id"], 0)
+        self.assertEqual(layer0.kwargs["index_k_layer_id"], 0)
+        # Target layer 1: index layer miss -> index_k_layer_id=-1.
+        self.assertEqual(layer1.kwargs["layer_id"], 1)
+        self.assertEqual(layer1.kwargs["host_layer_id"], 1)
+        self.assertEqual(layer1.kwargs["index_k_layer_id"], -1)
+        # Draft layer: device layer id restarts at 0 while the host layer
+        # offset keeps the accumulated target layers; index components stay
+        # target-only.
+        self.assertIs(draft_call.kwargs["device_k"], draft.k)
+        self.assertIs(draft_call.kwargs["host_k"], host.k_buffer)
+        self.assertEqual(draft_call.kwargs["layer_id"], 0)
+        self.assertEqual(draft_call.kwargs["host_layer_id"], 2)
+        self.assertEqual(draft_call.kwargs["index_k_layer_id"], -1)
+        self.assertIsNone(draft_call.kwargs["device_index_k"])
+        self.assertIsNone(draft_call.kwargs["host_index_k"])
+        self.assertIsNone(draft_call.kwargs["device_index_k_scale"])
+        self.assertIsNone(draft_call.kwargs["host_index_k_scale"])
+
+        legacy.assert_not_called()
+        dim_exchange.assert_not_called()
+
+    def test_per_layer_h2d_forwards_empty_v_as_is(self):
+        host, target, _ = self._sliced_host()
+        target.v = torch.empty(0)
+        host.v_buffer = torch.empty(0)
+        kv_split = mock.Mock()
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 4], dtype=torch.int64)
+        with self._mf_aiv_dispatch(host, kv_split):
+            host.load_to_device_per_layer(
+                object(), host_indices, device_indices, 0, "kernel_ascend"
+            )
+        call = kv_split.transfer_kv_per_layer_kv_split_pf_lf.call_args
+        # Empty V is forwarded as-is; the operator implementation owns the
+        # component pairing and empty-value rules.
+        self.assertIs(call.kwargs["device_v"], target.v)
+        self.assertIs(call.kwargs["host_v"], host.v_buffer)
+
+    def test_all_layer_d2h_accumulates_host_layer_start_per_pool(self):
+        host, target, draft = self._sliced_host()
+        kv_split = mock.Mock()
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 4], dtype=torch.int64)
+        with self._mf_aiv_dispatch(host, kv_split) as (legacy, dim_exchange):
             host.backup_from_device_all_layer(
                 object(), host_indices, device_indices, "kernel_ascend"
             )
-            self.assertEqual(transfer.call_count, 2)
-            self.assertIs(transfer.call_args_list[0].args[0].k, target.k)
-            self.assertIs(transfer.call_args_list[1].args[0].k, draft.k)
-            self.assertEqual(transfer.call_args_list[0].args[1][0].shape[1], 2)
-            self.assertEqual(transfer.call_args_list[1].args[1][0].shape[1], 1)
+
+        op = kv_split.transfer_kv_all_layer_kv_split_lf_pf
+        self.assertEqual(op.call_count, 2)
+        target_call, draft_call = op.call_args_list
+        # Target pool: full host buffers, raw indices, 4-D scales, one call.
+        self.assertIs(target_call.kwargs["device_k"], target.k)
+        self.assertIs(target_call.kwargs["host_k"], host.k_buffer)
+        self.assertIs(target_call.kwargs["device_v"], target.v)
+        self.assertIs(target_call.kwargs["host_v"], host.v_buffer)
+        self.assertIs(target_call.kwargs["device_index_k"], target.index_k)
+        self.assertIs(target_call.kwargs["host_index_k"], host.index_k_buffer)
+        self.assertIs(target_call.kwargs["device_index_k_scale"], target.index_scales)
+        self.assertIs(target_call.kwargs["host_index_k_scale"], host.index_k_scale_buffer)
+        self.assertIs(target_call.kwargs["host_indices"], host_indices)
+        self.assertIs(target_call.kwargs["device_indices"], device_indices)
+        self.assertEqual(target_call.kwargs["page_size"], host.page_size)
+        self.assertEqual(target_call.kwargs["host_layer_start"], 0)
+        # Draft pool: host_layer_start accumulates the target pool's device
+        # layers; index components are target-only.
+        self.assertIs(draft_call.kwargs["device_k"], draft.k)
+        self.assertIs(draft_call.kwargs["host_k"], host.k_buffer)
+        self.assertEqual(draft_call.kwargs["host_layer_start"], 2)
+        self.assertIsNone(draft_call.kwargs["device_index_k"])
+        self.assertIsNone(draft_call.kwargs["host_index_k"])
+        self.assertIsNone(draft_call.kwargs["device_index_k_scale"])
+        self.assertIsNone(draft_call.kwargs["host_index_k_scale"])
+
+        legacy.assert_not_called()
+        dim_exchange.assert_not_called()
+
+    def test_all_layer_d2h_skips_incompatible_draft_pool(self):
+        host, target, draft = self._sliced_host()
+        # Draft KV row width diverges from the host pool: the framework skips
+        # the pool but still advances host_layer_start.
+        draft.k = torch.empty(1, 4, 2, 1, 5)
+        kv_split = mock.Mock()
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 4], dtype=torch.int64)
+        with self._mf_aiv_dispatch(host, kv_split) as (legacy, dim_exchange):
+            host.backup_from_device_all_layer(
+                object(), host_indices, device_indices, "kernel_ascend"
+            )
+
+        op = kv_split.transfer_kv_all_layer_kv_split_lf_pf
+        op.assert_called_once()
+        self.assertIs(op.call_args.kwargs["device_k"], target.k)
+        self.assertEqual(op.call_args.kwargs["host_layer_start"], 0)
 
         legacy.assert_not_called()
         dim_exchange.assert_not_called()

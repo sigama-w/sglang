@@ -28,6 +28,7 @@ _memfabric_state = {
 }
 _mf_aiv_state = {
     "kvcacheio": None,
+    "kv_exchange": None,
     "initialized": False,
     "reserved_bytes": 0,
     "allocated_bytes": 0,
@@ -149,6 +150,21 @@ def _get_mf_aiv_kvcacheio():
             ) from exc
         _mf_aiv_state["kvcacheio"] = kvcacheio
     return _mf_aiv_state["kvcacheio"]
+
+
+def _get_mf_aiv_kv_exchange():
+    """Lazily import the MF+AIV kv_split transfer operator module."""
+    if _mf_aiv_state["kv_exchange"] is None:
+        try:
+            from sgl_kernel_npu.operators import kv_exchange
+        except ImportError as exc:
+            raise ImportError(
+                "SGLANG_HICACHE_NPU_BACKEND=mf_aiv requires an "
+                "sgl-kernel-npu build with the kv_exchange operator domain "
+                "(operators/kv_exchange)"
+            ) from exc
+        _mf_aiv_state["kv_exchange"] = kv_exchange
+    return _mf_aiv_state["kv_exchange"]
 
 
 def _mf_aiv_aligned_bytes(nbytes: int) -> int:
