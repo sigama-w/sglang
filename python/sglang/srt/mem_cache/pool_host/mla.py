@@ -5,6 +5,7 @@ from typing import Optional, Sequence
 
 import msgspec
 import torch
+from torch.distributed import get_rank
 
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
@@ -827,6 +828,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                     has_index_k = native.index_k is not None
                     has_scales = native.index_scales is not None
+                    if get_rank() == 0:
+                        logger.info(
+                            "[mf_aiv][H2D] per_layer layer_id=%d host_layer_id=%d pages=%d index_k_layer_id=%d",
+                            device_layer_id,
+                            host_layer_id,
+                            host_indices.numel() // self.page_size,
+                            ik_start if ik_num == 1 else -1,
+                        )
                     _get_mf_aiv_kv_exchange().transfer_kv_per_layer_kv_split_pf_lf(
                         device_indices=device_indices,
                         host_indices=host_indices,
@@ -854,6 +863,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ik_start, ik_num = self._indexer_slot_range_for_layer(
                         native, device_layer_id
                     )
+                    if get_rank() == 0:
+                        logger.info(
+                            "[ascendc][H2D] per_layer layer_id=%d host_layer_id=%d pages=%d index_k_layer_id=%d",
+                            device_layer_id,
+                            host_layer_id,
+                            host_indices.numel() // self.page_size,
+                            ik_start if ik_num == 1 else -1,
+                        )
                     self._transfer_ascendc_sparse_copy(
                         native,
                         host_indices,
@@ -1172,6 +1189,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     # components plus the pool's host_layer_start; the C++
                     # adapter folds the layer offsets into the base addresses.
                     # Pool compatibility policy stays here in the framework.
+                    if get_rank() == 0:
+                        logger.info(
+                            "[mf_aiv][D2H] all_layer pools=%d pages=%d",
+                            len(self._native_infos),
+                            host_indices.numel() // self.page_size,
+                        )
                     kv_split = _get_mf_aiv_kv_exchange()
                     host_layer_start = 0
                     for i, info in enumerate(self._native_infos):
@@ -1206,6 +1229,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         host_layer_start += native.k.shape[0]
                     return
                 if _is_npu and ascendc_io_enabled():
+                    if get_rank() == 0:
+                        logger.info(
+                            "[ascendc][D2H] all_layer pages=%d",
+                            host_indices.numel() // self.page_size,
+                        )
                     self._transfer_ascendc_sparse_copy(
                         native,
                         host_indices,
