@@ -30,8 +30,13 @@ def _timing_events_supported() -> bool:
 
 def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
-    kwargs = {"enable_timing": True} if timing_enabled else {}
-    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
+    if not timing_enabled:
+        # Without event timing the start event would never be read (only
+        # elapsed_time consumers touch it), so keep the completion signal
+        # alone instead of creating and recording a dead event.
+        return None, device_module.Event(), False
+    kwargs = {"enable_timing": True}
+    return device_module.Event(**kwargs), device_module.Event(**kwargs), True
 
 
 class L2Transfer(NamedTuple):
@@ -102,19 +107,26 @@ class L2TransferEngine:
 
     @contextmanager
     def _submission(self, transfers, stream, transfer_key, start_event=None):
-        start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
         domains = shared_host_layout_domains(t.host_pool for t in transfers)
         for domain in domains:
             domain.acquire_layout()
+        # Index preparation can read producer-owned device indices; without a
+        # caller-supplied producer event, order the transfer against the
+        # caller's current stream through one native stream wait instead of
+        # creating and recording a throwaway event.
+        caller_stream = None if start_event is not None else device_module.current_stream()
         finish_recorded = False
         try:
             with device_module.stream(stream):
-                # Index preparation can read producer-owned device indices.
-                start_event.wait(stream)
+                if start_event is not None:
+                    start_event.wait(stream)
+                else:
+                    stream.wait_stream(caller_stream)
                 prepared = self._prepare_transfers(transfers)
-                ack_start.record()
+                if ack_start is not None:
+                    ack_start.record()
                 yield prepared, completion
                 ack_finish.record()
                 finish_recorded = True
@@ -181,13 +193,6 @@ class L2TransferEngine:
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion
-
-    @staticmethod
-    def _start_event(start_event):
-        if start_event is None:
-            start_event = device_module.Event()
-            start_event.record()
-        return start_event
 
     @staticmethod
     def _record_stream(transfers: list[L2Transfer], stream, resolved=()) -> None:
