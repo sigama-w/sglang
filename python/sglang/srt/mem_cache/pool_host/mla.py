@@ -687,6 +687,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         layer_done_events,
         *,
         is_draft: bool = False,
+        layer_mapper=None,
     ):
         """Fused H2D load: one submission covering every target layer.
 
@@ -737,11 +738,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         for layer_id in sorted(self._target_layer_indices):
             if layer_id >= num_ctrl_layers:
                 continue
-            slot = index_slots.get(layer_id)
+            # Mirror the per-layer loop's mapper contract: the mapped local
+            # layer selects this pool's binding (device/host rows, indexer
+            # slot); a None mapping drops the layer's launch but its done
+            # event still fires in the C++ ctrl loop.
+            local_layer_id = (
+                layer_id if layer_mapper is None else layer_mapper(layer_id)
+            )
+            if local_layer_id is None:
+                continue
+            slot = index_slots.get(local_layer_id)
             iter_table += (
                 layer_id,
-                layer_id,
-                self._host_layer_by_controller[layer_id],
+                local_layer_id,
+                self._host_layer_by_controller[local_layer_id],
                 -1 if slot is None else slot,
             )
         if not iter_table:

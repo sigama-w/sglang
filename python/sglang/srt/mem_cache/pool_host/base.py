@@ -479,6 +479,7 @@ class HostKVCache(abc.ABC):
         layer_done_events,
         *,
         is_draft: bool = False,
+        layer_mapper=None,
     ) -> None:
         self.load_to_device_range(
             device_pool,
@@ -488,6 +489,7 @@ class HostKVCache(abc.ABC):
             num_ctrl_layers,
             layer_done_events,
             is_draft=is_draft,
+            layer_mapper=layer_mapper,
         )
 
     def load_to_device_range(
@@ -500,6 +502,7 @@ class HostKVCache(abc.ABC):
         layer_done_events,
         *,
         is_draft: bool = False,
+        layer_mapper=None,
     ) -> None:
         raise NotImplementedError(
             "This host pool does not support fused layer-range transfers."

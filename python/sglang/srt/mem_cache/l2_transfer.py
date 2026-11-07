@@ -143,30 +143,31 @@ class L2TransferEngine:
         return completion
 
     def _fused_layer_range(self, transfers, layer_done_events):
-        """The single transfer whose whole H2D program can run in one fused
+        """The single target transfer whose H2D program can run in one fused
         NPU submission, or None to fall back to the per-layer loop.
 
-        Fusing across multiple transfers would record a layer's done event
-        before every pool has launched that layer, so only the lone,
-        unmapped, non-draft transfer qualifies; layer-mapped draft and
-        multi-pool submissions keep the per-layer ordering.
+        Exactly one non-draft, range-capable transfer may fuse: the C++ loop
+        records each layer's done event right after that layer's launches, so
+        a second fused target pool could record the event before its own
+        launch. Everything else -- layer-mapped drafts, secondary pools --
+        stays on the per-layer loop, which runs BEFORE the fused submission
+        so their work is already enqueued when the events are recorded
+        (drafts must finish before the final target-layer event).
         """
         if (
             self.io_backend != "kernel_ascend"
             or layer_done_events is None
             or getattr(layer_done_events, "event_pool_id", None) is None
-            or len(transfers) != 1
-        ):
-            return None
-        transfer = transfers[0]
-        if (
-            transfer.layer_mapper is not None
-            or transfer.is_draft
-            or not getattr(transfer.host_pool, "supports_layer_range_transfer", False)
             or envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
         ):
             return None
-        return transfer
+        candidates = [
+            t
+            for t in transfers
+            if not t.is_draft
+            and getattr(t.host_pool, "supports_layer_range_transfer", False)
+        ]
+        return candidates[0] if len(candidates) == 1 else None
 
     def submit_host_to_device(
         self,
@@ -182,10 +183,38 @@ class L2TransferEngine:
         ) as (transfers, completion):
             fused = self._fused_layer_range(transfers, layer_done_events)
             if fused is not None:
-                # One call replaces the whole per-layer loop: every layer's
-                # kernel launches and its pooled done-event record happen in
-                # the kernel-side C++ loop, preserving the per-layer event
-                # granularity the forward pipeline waits on.
+                # Enqueue every remaining transfer (layer-mapped drafts,
+                # secondary pools) on the per-layer loop FIRST: the fused C++
+                # loop records each layer's done event right after that
+                # layer's launches, and drafts must already be enqueued by
+                # then ("finish every draft before the final target-layer
+                # event"). All launches share this stream, so ordering holds.
+                rest = [t for t in transfers if t is not fused]
+                for layer_id in range(transfer_layer_id_max):
+                    for transfer in rest:
+                        local_layer_id = (
+                            transfer.layer_mapper(layer_id)
+                            if transfer.layer_mapper is not None
+                            else layer_id
+                        )
+                        if local_layer_id is None or (
+                            transfer.layer_mapper is None
+                            and layer_id >= transfer.host_pool.layer_num
+                        ):
+                            continue
+                        transfer.host_pool.load_to_device_per_layer_physical(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
+                # One call replaces the target's per-layer loop: every
+                # layer's kernel launches and its pooled done-event record
+                # happen in the kernel-side C++ loop, preserving the per-layer
+                # event granularity the forward pipeline waits on. Layers the
+                # mapper drops never launch, yet still get their event.
                 fused.host_pool.load_to_device_range_physical(
                     fused.device_pool,
                     fused.host_indices,
@@ -194,6 +223,7 @@ class L2TransferEngine:
                     transfer_layer_id_max,
                     layer_done_events,
                     is_draft=fused.is_draft,
+                    layer_mapper=fused.layer_mapper,
                 )
                 return completion
             primary = transfers[0] if transfers else None
