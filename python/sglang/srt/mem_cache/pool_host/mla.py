@@ -77,6 +77,8 @@ if _is_npu:
         transfer_kv_all_layer_kv_split_lf_pf,
         transfer_kv_per_layer_kv_split,
         transfer_kv_per_layer_kv_split_pf_lf,
+        transfer_kv_range_kv_split,
+        transfer_kv_range_kv_split_pf_lf,
     )
 
 logger = logging.getLogger(__name__)
@@ -675,6 +677,98 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def load_to_device_range(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        num_ctrl_layers: int,
+        layer_done_events,
+        *,
+        is_draft: bool = False,
+    ):
+        """Fused H2D load: one submission covering every target layer.
+
+        Replaces the per-layer Python dispatch loop (one op call plus one
+        event record per layer) with a single range call whose C++ loop
+        launches each layer's kv_exchange and records the pooled layer-done
+        event; the per-layer event granularity the forward pipeline waits on
+        is preserved bit-for-bit.
+        """
+        assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
+        if io_backend != "kernel_ascend":
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+        if self.layout == "page_first_kv_split":
+            transfer = transfer_kv_range_kv_split_pf_lf
+        elif self.layout == "layer_first_kv_split":
+            transfer = transfer_kv_range_kv_split
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
+        # The target pool always leads _npu_pool_bindings; drafts ride along
+        # only via separate layer-mapped transfers, which stay on the
+        # per-layer loop (see L2TransferEngine.submit_host_to_device).
+        native = self._npu_pool_bindings[0][0]
+        # Mirror the per-layer binding contract: the Indexer pair participates
+        # only when both device and host sides exist; a partially supplied
+        # pair would be silently dropped per layer, so its rows lose their
+        # slots here as well.
+        has_indexer = (
+            native.index_k is not None
+            and native.index_scales is not None
+            and self.index_k_buffer is not None
+            and self.index_k_scale_buffer is not None
+        )
+        index_slots = (
+            {layer: slot for slot, layer in enumerate(native.index_layer_indices)}
+            if has_indexer
+            else {}
+        )
+        # Rows: [ctrl, device_layer, host_layer, index_slot]; slot < 0 marks a
+        # layer without Indexer KV. Draft controller layers are excluded, as
+        # the per-layer path skips them for this (single) transfer too.
+        iter_table = []
+        for layer_id in sorted(self._target_layer_indices):
+            if layer_id >= num_ctrl_layers:
+                continue
+            slot = index_slots.get(layer_id)
+            iter_table += (
+                layer_id,
+                layer_id,
+                self._host_layer_by_controller[layer_id],
+                -1 if slot is None else slot,
+            )
+        if not iter_table:
+            raise ValueError("fused range transfer found no target layers")
+        scale = native.index_scales
+        if scale is not None and scale.ndim == 4:
+            scale = scale.unsqueeze(-1)
+        transfer(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=[native.k],
+            host_k=[self.k_buffer],
+            device_v=[native.v],
+            host_v=[self.v_buffer],
+            device_index_k=[native.index_k] if has_indexer else None,
+            host_index_k=[self.index_k_buffer] if has_indexer else None,
+            device_index_k_scale=[scale] if has_indexer else None,
+            host_index_k_scale=[self.index_k_scale_buffer] if has_indexer else None,
+            page_size=self.page_size,
+            num_ctrl_layers=num_ctrl_layers,
+            iter_table=iter_table,
+            pool_iter_counts=[len(iter_table) // 4],
+            event_pool_id=layer_done_events.event_pool_id,
+            event_first_index=layer_done_events.event_first_index,
+            impl="auto",
+        )
+
     def _backup_from_device_per_layer(
         self,
         host_indices,
@@ -823,6 +917,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             layer_start = layer_end
         self._npu_pool_bindings = tuple(pools)
+        # Fused layer-range submissions are available once the NPU bindings
+        # exist (see L2TransferEngine.submit_host_to_device).
+        self.supports_layer_range_transfer = True
 
     def _warn_draft_indexer_skipped(self, native):
         if getattr(self, "_draft_indexer_skip_warned", False):

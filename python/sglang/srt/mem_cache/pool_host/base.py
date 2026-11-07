@@ -464,6 +464,47 @@ class HostKVCache(abc.ABC):
             is_draft=is_draft,
         )
 
+    # Set by host pools that submit every controller layer's H2D load in one
+    # fused NPU call (load_to_device_range_physical), recording the per-layer
+    # completion events inside the kernel-side C++ loop.
+    supports_layer_range_transfer = False
+
+    def load_to_device_range_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        num_ctrl_layers: int,
+        layer_done_events,
+        *,
+        is_draft: bool = False,
+    ) -> None:
+        self.load_to_device_range(
+            device_pool,
+            host_indices,
+            device_indices,
+            io_backend,
+            num_ctrl_layers,
+            layer_done_events,
+            is_draft=is_draft,
+        )
+
+    def load_to_device_range(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        num_ctrl_layers: int,
+        layer_done_events,
+        *,
+        is_draft: bool = False,
+    ) -> None:
+        raise NotImplementedError(
+            "This host pool does not support fused layer-range transfers."
+        )
+
     @abc.abstractmethod
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         """

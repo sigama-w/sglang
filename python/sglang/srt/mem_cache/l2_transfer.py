@@ -142,6 +142,32 @@ class L2TransferEngine:
                 )
         return completion
 
+    def _fused_layer_range(self, transfers, layer_done_events):
+        """The single transfer whose whole H2D program can run in one fused
+        NPU submission, or None to fall back to the per-layer loop.
+
+        Fusing across multiple transfers would record a layer's done event
+        before every pool has launched that layer, so only the lone,
+        unmapped, non-draft transfer qualifies; layer-mapped draft and
+        multi-pool submissions keep the per-layer ordering.
+        """
+        if (
+            self.io_backend != "kernel_ascend"
+            or layer_done_events is None
+            or getattr(layer_done_events, "event_pool_id", None) is None
+            or len(transfers) != 1
+        ):
+            return None
+        transfer = transfers[0]
+        if (
+            transfer.layer_mapper is not None
+            or transfer.is_draft
+            or not getattr(transfer.host_pool, "supports_layer_range_transfer", False)
+            or envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
+        ):
+            return None
+        return transfer
+
     def submit_host_to_device(
         self,
         transfers: list[L2Transfer],
@@ -149,10 +175,27 @@ class L2TransferEngine:
         transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
+        layer_done_events=None,
     ) -> TransferCompletion:
         with self._submission(
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
+            fused = self._fused_layer_range(transfers, layer_done_events)
+            if fused is not None:
+                # One call replaces the whole per-layer loop: every layer's
+                # kernel launches and its pooled done-event record happen in
+                # the kernel-side C++ loop, preserving the per-layer event
+                # granularity the forward pipeline waits on.
+                fused.host_pool.load_to_device_range_physical(
+                    fused.device_pool,
+                    fused.host_indices,
+                    fused.device_indices,
+                    self.io_backend,
+                    transfer_layer_id_max,
+                    layer_done_events,
+                    is_draft=fused.is_draft,
+                )
+                return completion
             primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):

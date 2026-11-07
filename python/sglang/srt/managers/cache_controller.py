@@ -62,30 +62,79 @@ def storage_model_name(
     return f"{model_name}-{tag}" if model_name else tag
 
 
+class _NpuEventPoolEvent:
+    """Query-only facade over one kv_exchange event-pool slot."""
+
+    def __init__(self, pool_id: int, index: int):
+        self._pool_id = pool_id
+        self._index = index
+
+    def query(self) -> bool:
+        return bool(
+            torch.ops.npu.kv_exchange_event_pool_query(self._pool_id, self._index)
+        )
+
+
 class LayerLoadingEvent:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        event_pool_id: Optional[int] = None,
+        event_first_index: int = 0,
+    ):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
+        # Pool mode backs every per-layer event with a preallocated aclrtEvent
+        # from the kv_exchange event pool, so the fused C++ submission loop
+        # can record them without Python dispatching one event per layer.
+        self.event_pool_id = event_pool_id
+        self.event_first_index = event_first_index
+        self.load_events = (
+            None
+            if event_pool_id is not None
+            else [device_module.Event() for _ in range(num_layers)]
+        )
         self.start_event = device_module.Event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
-        self.load_events[layer_index].record()
+        if self.event_pool_id is not None:
+            torch.ops.npu.kv_exchange_event_pool_record(
+                self.event_pool_id, self.event_first_index + layer_index
+            )
+        else:
+            self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        device_module.current_stream().wait_event(self.load_events[layer_index])
+        if self.event_pool_id is not None:
+            torch.ops.npu.kv_exchange_event_pool_wait(
+                self.event_pool_id, self.event_first_index + layer_index
+            )
+        else:
+            device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
+        if self.event_pool_id is not None:
+            return _NpuEventPoolEvent(
+                self.event_pool_id,
+                self.event_first_index + self._num_layers - 1,
+            )
         return self.load_events[-1]
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, event_pool_id: Optional[int] = None):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
-        self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
+        self.events = [
+            (
+                LayerLoadingEvent(num_layers)
+                if event_pool_id is None
+                else LayerLoadingEvent(num_layers, event_pool_id, i * num_layers)
+            )
+            for i in range(self.num_counters)
+        ]
         self.producer_index = -1
         self.consumer_index = -1
 
@@ -356,7 +405,10 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        self.layer_done_counter = LayerDoneCounter(
+            self.transfer_layer_id_max,
+            event_pool_id=self._create_kv_exchange_event_pool(),
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -1029,6 +1081,32 @@ class HiCacheController:
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
+    def _create_kv_exchange_event_pool(self) -> Optional[int]:
+        """Create the kv_exchange event pool backing pooled layer-done events.
+
+        Pool mode lets the fused NPU submission record every per-layer
+        completion event inside its C++ loop instead of one Python
+        event.record() per layer. Returns None (local device events) on
+        non-kernel_ascend backends or when the control-plane ops are
+        unavailable (e.g. a stale kernel build).
+        """
+        if self.io_backend != "kernel_ascend":
+            return None
+        try:
+            # One slot per layer per producer/consumer ring slot (3 counters).
+            return int(
+                torch.ops.npu.kv_exchange_event_pool_create(
+                    3 * self.transfer_layer_id_max
+                )
+            )
+        except (AttributeError, RuntimeError) as e:
+            logger.warning(
+                "kv_exchange event pool unavailable (%s); "
+                "using local layer loading events",
+                e,
+            )
+            return None
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -1053,6 +1131,7 @@ class HiCacheController:
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
+            layer_done_events=producer_event,
         )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
