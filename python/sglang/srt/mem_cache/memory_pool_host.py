@@ -599,7 +599,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                         device_v=torch.empty(0, device=dev_view.device),
                         host_v=torch.empty(0, device="cpu"),
                         page_size=native_page_size,
-                        impl="aiv",
+                        impl="auto",
                     )
                 else:
                     transfer_kv_all_layer_kv_split_lf_pf(
@@ -611,7 +611,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                         host_v=torch.empty(0, device="cpu"),
                         page_size=native_page_size,
                         host_layer_start=0,
-                        impl="aiv",
+                        impl="auto",
                     )
 
         else:
@@ -707,7 +707,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     page_size=native_page_size,
                     device_layer_id=0,
                     host_layer_id=0,
-                    impl="aiv",
+                    impl="auto",
                 )
             else:
                 transfer_kv_per_layer_kv_split_pf_lf(
@@ -720,7 +720,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     page_size=native_page_size,
                     device_layer_id=0,
                     host_layer_id=0,
-                    impl="aiv",
+                    impl="auto",
                 )
 
         else:
@@ -1120,7 +1120,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                         device_v=torch.empty(0, device=dev_view.device),
                         host_v=torch.empty(0, device="cpu"),
                         page_size=self.ring_size,
-                        impl="aiv",
+                        impl="auto",
                     )
                 else:
                     transfer_kv_all_layer_kv_split_lf_pf(
@@ -1132,7 +1132,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                         host_v=torch.empty(0, device="cpu"),
                         page_size=self.ring_size,
                         host_layer_start=0,
-                        impl="aiv",
+                        impl="auto",
                     )
         else:
             raise ValueError(
@@ -1216,7 +1216,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     page_size=R,
                     device_layer_id=0,
                     host_layer_id=0,
-                    impl="aiv",
+                    impl="auto",
                 )
             else:
                 transfer_kv_per_layer_kv_split_pf_lf(
@@ -1229,7 +1229,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     page_size=R,
                     device_layer_id=0,
                     host_layer_id=0,
-                    impl="aiv",
+                    impl="auto",
                 )
 
         else:
