@@ -277,20 +277,41 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.assertIsNone(kw["host_index_k"])
         self.assertIsNone(kw["device_index_layer_id"])
 
-    def test_d2h_passes_pool_offsets_and_target_only_indexer(self):
+    def test_d2h_passes_pool_views_and_target_only_indexer(self):
         draft = self.add_draft()
         for layout, name in (
             ("page_first_kv_split", "transfer_kv_all_layer_kv_split_lf_pf"),
             ("layer_first_kv_split", "transfer_kv_all_layer_kv_split"),
         ):
             with self.subTest(layout=layout):
-                self.host.layout = layout
+                if self.host.layout != layout:
+                    for attr in (
+                        "k_buffer",
+                        "v_buffer",
+                        "index_k_buffer",
+                        "index_k_scale_buffer",
+                    ):
+                        setattr(
+                            self.host, attr, getattr(self.host, attr).transpose(0, 1)
+                        )
+                    self.host.layout = layout
+                    self.host._init_npu_transfer_bindings()
+                axis = 0 if layout == "layer_first_kv_split" else 1
                 self.host.backup_from_device_all_layer(
                     None, "host", "device", "kernel_ascend"
                 )
                 calls = self.ops[name].call_args_list
                 self.assertEqual(len(calls), 2)
-                self.assertEqual([c.kwargs["host_layer_start"] for c in calls], [0, 3])
+                for call, (start, count) in zip(calls, ((0, 3), (3, 1))):
+                    self.assertEqual(call.kwargs.get("host_layer_start", 0), 0)
+                    self.assertEqual(
+                        call.kwargs["host_k"].selection,
+                        (self.host.k_buffer, axis, start, count),
+                    )
+                    self.assertEqual(
+                        call.kwargs["host_v"].selection,
+                        (self.host.v_buffer, axis, start, count),
+                    )
                 self.assertIs(calls[0].kwargs["host_index_k"], self.host.index_k_buffer)
                 self.assertIsNone(calls[1].kwargs["host_index_k"])
                 self.assertIs(calls[1].kwargs["device_k"], draft.k)
@@ -299,7 +320,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.add_draft(width=999)
         self.add_draft()
         pools = self.host._npu_pool_bindings
-        self.assertEqual([offset for _, offset, _ in pools], [0, 4])
+        self.assertEqual([host_k.selection[2] for _, host_k, _, _ in pools], [0, 4])
 
     def test_incompatible_draft_skips_both_directions_and_preserves_next_binding(self):
         self.add_draft(width=999)
@@ -318,7 +339,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.assertEqual(kw["host_k"].selection, (self.host.k_buffer, 1, 4, 1))
         self.host.backup_from_device_all_layer(None, "host", "device", "kernel_ascend")
         calls = self.ops["transfer_kv_all_layer_kv_split_lf_pf"].call_args_list
-        self.assertEqual([c.kwargs["host_layer_start"] for c in calls], [0, 4])
+        self.assertEqual([c.kwargs["host_k"].selection[2] for c in calls], [0, 4])
 
     def test_transfers_reuse_bindings_without_resolving_pools_or_checking_drafts(self):
         self.add_draft()

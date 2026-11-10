@@ -725,16 +725,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         layer_start = 0
         host_layer_axis = 0 if self.layout == "layer_first_kv_split" else 1
 
-        def layer_view(buffer, axis, layer):
+        def layer_view(buffer, axis, layer, count=1):
             if buffer is None or not buffer.numel():
                 return buffer
-            if layer == 0 and buffer.shape[axis] == 1:
+            if layer == 0 and buffer.shape[axis] == count:
                 return buffer
-            return buffer.narrow(axis, layer, 1)
+            return buffer.narrow(axis, layer, count)
 
         for i, info in enumerate(self._native_infos):
             native = info.native_buffers()
-            layer_end = layer_start + native.k.shape[0]
+            num_layers = native.k.shape[0]
+            layer_end = layer_start + num_layers
             is_target = i == 0
             if not is_target:
                 if native.index_k is not None:
@@ -743,7 +744,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     self._npu_layer_bindings[self._device_layer_num + i - 1] = None
                     layer_start = layer_end
                     continue
-            pools.append((native, layer_start, is_target))
+            host_k = layer_view(self.k_buffer, host_layer_axis, layer_start, num_layers)
+            host_v = layer_view(self.v_buffer, host_layer_axis, layer_start, num_layers)
+            pools.append((native, host_k, host_v, is_target))
             index_slots = (
                 {layer: slot for slot, layer in enumerate(native.index_layer_indices)}
                 if is_target and self.index_k_buffer is not None
@@ -961,20 +964,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 transfer = transfer_kv_all_layer_kv_split
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
-            for native, host_layer_start, is_target in self._npu_pool_bindings:
+            for native, host_k, host_v, is_target in self._npu_pool_bindings:
                 transfer(
                     device_indices=device_indices,
                     host_indices=host_indices,
                     device_k=native.k,
-                    host_k=self.k_buffer,
+                    host_k=host_k,
                     device_v=native.v,
-                    host_v=self.v_buffer,
+                    host_v=host_v,
                     device_index_k=native.index_k,
                     host_index_k=self.index_k_buffer if is_target else None,
                     device_index_k_scale=native.index_scales,
                     host_index_k_scale=self.index_k_scale_buffer if is_target else None,
                     page_size=self.page_size,
-                    host_layer_start=host_layer_start,
                     impl="auto",
                 )
         else:
