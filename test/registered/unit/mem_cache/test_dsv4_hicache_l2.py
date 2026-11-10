@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import npu_host_memory
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
@@ -369,138 +370,6 @@ class TestDSV4HostViews(CustomTestCase):
                     )
                 )
 
-    def test_dsv4_acl_capacity_declares_paged_pool_bytes(self):
-        kvcache = SimpleNamespace(
-            swa_kv_pool=SimpleNamespace(
-                kv_buffer=[object(), object()], bytes_per_page_padded=6
-            )
-        )
-        backend = MagicMock()
-        with (
-            patch.object(assembler, "is_npu", return_value=True),
-            patch.object(
-                assembler,
-                "get_memory",
-                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
-            ),
-            patch.object(assembler, "get_host_memory_backend", return_value=backend),
-            patch.object(
-                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
-            ),
-        ):
-            assembler._reserve_dsv4_paged_host_memory(
-                kvcache=kvcache,
-                page_size=4,
-                num_host_pages=4,
-                swa_num_host_pages=4,
-                c128_num_host_pages=0,
-                has_paged_swa=True,
-                mtp_swa_device_buffers=[],
-                c4_layer_mapping={},
-                c4_state_global_layers=[],
-                c128_layer_mapping={},
-            )
-        backend.ensure_capacity.assert_called_once_with(48, 0)
-
-    def test_capacity_declares_actual_paged_and_state_allocations(self):
-        def state_pool(slot_bytes):
-            return SimpleNamespace(
-                ring_size=2,
-                kv_score_buffer=SimpleNamespace(
-                    kv_score=[SimpleNamespace(nbytes=slot_bytes)]
-                ),
-            )
-
-        kvcache = SimpleNamespace(
-            swa_kv_pool=SimpleNamespace(
-                kv_buffer=[object(), object()], bytes_per_page_padded=6
-            ),
-            compress_state_pools=[state_pool(4), state_pool(4)],
-            indexer_compress_state_pools=[state_pool(8), state_pool(8)],
-        )
-        expected_blocks = {
-            "layer_first": [24, 24, 24, 16, 16, 12, 8, 8, 32, 32, 64, 64, 10, 14],
-            "page_first": [72, 32, 12, 16, 64, 128, 10, 14],
-        }
-        for backend_name in ("acl", "memfabric"):
-            for layout, blocks in expected_blocks.items():
-                backend = MagicMock(name=backend_name)
-                with (
-                    self.subTest(backend=backend_name, layout=layout),
-                    patch.object(assembler, "is_npu", return_value=True),
-                    patch.object(
-                        assembler,
-                        "get_memory",
-                        return_value=SimpleNamespace(hicache_mem_layout=layout),
-                    ),
-                    patch.object(
-                        assembler, "get_host_memory_backend", return_value=backend
-                    ),
-                    patch.object(
-                        assembler,
-                        "_dsv4_compressed_region_buffers",
-                        side_effect=[
-                            ([object(), object()], 4),
-                            ([object()], 5),
-                        ],
-                    ),
-                    patch.object(
-                        assembler,
-                        "_dsv4_indexer_regions",
-                        return_value=[
-                            SimpleNamespace(device_buffers=[object()], item_bytes=3)
-                        ],
-                    ),
-                    patch.object(
-                        assembler,
-                        "_dsv4_rope_sibling",
-                        side_effect=[
-                            ("c4_rope", [object(), object()], 2),
-                            ("c128_rope", [object()], 7),
-                        ],
-                    ),
-                    patch.object(
-                        torch,
-                        "npu",
-                        SimpleNamespace(current_device=lambda: 0),
-                        create=True,
-                    ),
-                ):
-                    assembler._reserve_dsv4_paged_host_memory(
-                        kvcache=kvcache,
-                        page_size=4,
-                        num_host_pages=4,
-                        swa_num_host_pages=4,
-                        c128_num_host_pages=2,
-                        has_paged_swa=True,
-                        mtp_swa_device_buffers=[object()],
-                        c4_layer_mapping={0: 0, 1: 1},
-                        c4_state_global_layers=[0, 1],
-                        c128_layer_mapping={0: 0},
-                    )
-                backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
-
-    def test_non_npu_skips_host_memory_reservation(self):
-        with (
-            patch.object(assembler, "is_npu", return_value=False),
-            patch.object(assembler, "get_memory") as get_memory,
-            patch.object(assembler, "get_host_memory_backend") as get_backend,
-        ):
-            assembler._reserve_dsv4_paged_host_memory(
-                kvcache=None,
-                page_size=4,
-                num_host_pages=0,
-                swa_num_host_pages=0,
-                c128_num_host_pages=0,
-                has_paged_swa=False,
-                mtp_swa_device_buffers=[],
-                c4_layer_mapping={},
-                c4_state_global_layers=[],
-                c128_layer_mapping={},
-            )
-        get_memory.assert_not_called()
-        get_backend.assert_not_called()
-
 
 class TestC128L2Ownership(CustomTestCase):
     def test_eviction_hooks_accept_cache_actions(self):
@@ -586,6 +455,145 @@ class TestC128L2Ownership(CustomTestCase):
 
 
 class TestDSV4PoolAssembly(CustomTestCase):
+    def test_memfabric_reserves_all_backing_blocks_before_allocating(self):
+        def paged_pool(layers, width):
+            return SimpleNamespace(
+                kv_buffer=[
+                    torch.empty((4, width), dtype=torch.uint8) for _ in range(layers)
+                ],
+                bytes_per_page_padded=width,
+                page_size=4,
+            )
+
+        def state_pool(slot_bytes):
+            return SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=torch.empty((8, slot_bytes), dtype=torch.uint8)
+                ),
+            )
+
+        c4, c128 = paged_pool(2, 4), paged_pool(1, 5)
+        c4_rope, c128_rope = paged_pool(2, 2), paged_pool(1, 7)
+        kvcache = SimpleNamespace(
+            swa_kv_pool=paged_pool(2, 6),
+            swa_page_size=4,
+            c4_kv_pool=c4,
+            c128_kv_pool=c128,
+            c4_indexer_kv_pool=SimpleNamespace(
+                has_npu_storage=True,
+                index_k_buffer=paged_pool(2, 3).kv_buffer,
+                index_scale_buffer=paged_pool(2, 2).kv_buffer,
+            ),
+            compress_state_pools=[state_pool(4), state_pool(4)],
+            indexer_compress_state_pools=[state_pool(8), state_pool(8)],
+            unified_region_buffers=lambda ratio: (
+                (c4.kv_buffer, 4) if ratio == 4 else (c128.kv_buffer, 5)
+            ),
+            unified_rope_region_buffers=lambda ratio: (
+                (c4_rope.kv_buffer, 2) if ratio == 4 else (c128_rope.kv_buffer, 7)
+            ),
+            start_layer=0,
+            kv_pools={1: paged_pool(1, 9)},
+            index_pools={
+                1: SimpleNamespace(
+                    page_size=4, index_k_with_scale_buffer=paged_pool(1, 2).kv_buffer
+                )
+            },
+        )
+        params = SimpleNamespace(
+            page_size=4,
+            token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=MagicMock()),
+            mtp_draft_device_pools=[SimpleNamespace(swa_kv_pool=paged_pool(1, 6))],
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        mappings = assembler._DeepSeekV4LayerMappings(
+            transfer_layer_id_max=2,
+            full={0: 0, 1: 1},
+            swa={0: 0, 1: 1},
+            c4={0: 0, 1: 1},
+            c128={0: 0},
+            c4_state={0: 0, 1: 1},
+            c4_state_global_layers=[0, 1],
+        )
+
+        cases = (
+            (
+                True,
+                True,
+                False,
+                "layer_first",
+                [24, 24, 24, 16, 16, 12, 12, 8, 8, 32, 32, 64, 64, 10],
+            ),
+            (True, True, False, "page_first", [72, 32, 24, 16, 64, 128, 10]),
+            (True, True, True, "page_first", [32, 24, 16, 16, 10, 14, 36, 8]),
+            (True, False, False, "page_first", [72, 32, 24, 16, 64, 128, 10]),
+            (False, True, False, "page_first", [72, 32, 24, 16, 64, 128, 10]),
+        )
+        for npu, memfabric, unified, layout, blocks in cases:
+            kvcache._unified_kv = unified
+            kvcache.sources_by_ratio = {1: [0]} if unified else {}
+            memory = SimpleNamespace(
+                hicache_mem_layout=layout,
+                hicache_write_policy="write_through",
+                hicache_io_backend="kernel_ascend",
+                hicache_host_memory_mode="cache",
+            )
+            events = []
+
+            def allocate(dims, *, dtype, device, **kwargs):
+                buffer = torch.empty(dims, dtype=dtype, device=device)
+                events.append(("allocate", buffer.nbytes))
+                return buffer
+
+            backend = SimpleNamespace(
+                ensure_capacity=lambda size, device: events.append(
+                    ("reserve", size, device)
+                )
+            )
+            with (
+                self.subTest(
+                    npu=npu, memfabric=memfabric, unified=unified, layout=layout
+                ),
+                patch.object(assembler, "is_npu", return_value=npu),
+                patch.object(
+                    assembler, "memfabric_host_memory_enabled", return_value=memfabric
+                ),
+                patch.object(assembler, "get_memory", return_value=memory),
+                patch.object(assembler, "_get_allocator_type", return_value="default"),
+                patch.object(
+                    assembler, "_deepseek_v4_num_host_pages", return_value=(4, 4, 2)
+                ),
+                patch.object(assembler, "HybridCacheController"),
+                patch.object(
+                    npu_host_memory, "get_host_memory_backend", return_value=backend
+                ),
+                patch.object(
+                    torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+                ),
+                patch.object(memory_pool_host, "ALLOC_MEMORY_FUNCS", {"cpu": allocate}),
+                patch.object(
+                    memory_pool_host, "host_memory_budget_bytes", return_value=2**30
+                ),
+                patch.object(
+                    memory_pool_host, "make_kernel_ptr_table", return_value=None
+                ),
+            ):
+                assembler.build_deepseek_v4_hicache_stack(
+                    params=params,
+                    kvcache=kvcache,
+                    load_cache_event=None,
+                    storage_backend=None,
+                    layer_mappings=mappings,
+                )
+                expected = [("reserve", sum(blocks), 0)] if npu and memfabric else []
+                self.assertEqual(
+                    events, expected + [("allocate", size) for size in blocks]
+                )
+
     def test_npu_indexer_registers_k_and_scale_as_separate_host_pools(self):
         k_buffer = [torch.empty((2, 32, 1, 4), dtype=torch.int8)]
         scale_buffer = [torch.empty((2, 32, 1, 1), dtype=torch.float16)]

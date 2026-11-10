@@ -92,6 +92,7 @@ class MambaPoolHost(HostKVCache):
         allocator_type: str = "default",
         layout: str = "layer_first",
         mtp_draft_buffer_infos: Sequence[MambaStateBufferInfo] = (),
+        defer_allocation: bool = False,
     ):
         buffer_info.validate()
         self.buffer_info = buffer_info
@@ -191,13 +192,16 @@ class MambaPoolHost(HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
+        if not defer_allocation:
+            self.allocate_host_buffers()
+
+    def allocate_host_buffers(self) -> None:
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (%d state slots, layout=%s).",
-            requested_bytes / 1e9,
+            self.size * self.size_per_token / 1e9,
             self.size,
             self.layout,
         )
-
         self.temporal_device_ptrs = torch.tensor(
             [layer.data_ptr() for layer in self.temporal_device_layers],
             dtype=torch.uint64,
@@ -243,88 +247,49 @@ class MambaPoolHost(HostKVCache):
 
         logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
+    def host_buffer_specs(self):
+        if self.layout in ("page_first", "page_first_direct"):
+            state_dims = (self.size, self.num_mamba_layers, 1)
+        else:
+            state_dims = (self.num_mamba_layers, self.size)
+        # Side states already carry their own per-layer view and slot axis.
+        return (
+            (state_dims + self.temporal_state_shape, self.temporal_dtype),
+            *(
+                (state_dims + shape, self.conv_dtype)
+                for shape in self.conv_state_shapes
+            ),
+            *(
+                ((self.size, *state.shape[1:]), state.dtype)
+                for state in self.slot_state_device_tensors
+            ),
+        )
+
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self._buffer_device.type]
 
-        def alloc_func(dims, *, dtype, device, pin_memory, allocator):
+        def allocate(dims, dtype):
             # conv-only linear attention has no ssm state: mmap can't map the
             # 0-element temporal buffer, so hand back a plain empty tensor.
-            if np.prod(dims) == 0:
-                return torch.empty(dims, dtype=dtype, device=device)
+            if 0 in dims:
+                return torch.empty(dims, dtype=dtype, device=self.device)
             return _host_alloc(
                 dims,
                 dtype=dtype,
-                device=device,
-                pin_memory=pin_memory,
-                allocator=allocator,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
                 registration_granularity_bytes=(
                     int(np.prod(dims[1:])) * dtype.itemsize
                 ),
             )
 
-        if self.layout in ["page_first", "page_first_direct"]:
-            # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
-            temporal_dims = (
-                self.size,
-                self.num_mamba_layers,
-                1,
-            ) + self.temporal_state_shape
-            self.temporal_buffer = alloc_func(
-                temporal_dims,
-                dtype=self.temporal_dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
-            self.conv_buffer = []
-            for conv_shape in self.conv_state_shapes:
-                conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
-                self.conv_buffer.append(
-                    alloc_func(
-                        conv_dims,
-                        dtype=self.conv_dtype,
-                        device=self.device,
-                        pin_memory=self.pin_memory,
-                        allocator=self.allocator,
-                    )
-                )
-        else:
-            # layer-first: (num_layers, size, *shape)
-            temporal_dims = (
-                self.num_mamba_layers,
-                self.size,
-            ) + self.temporal_state_shape
-            self.temporal_buffer = alloc_func(
-                temporal_dims,
-                dtype=self.temporal_dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
-            self.conv_buffer = []
-            for conv_shape in self.conv_state_shapes:
-                conv_dims = (self.num_mamba_layers, self.size) + conv_shape
-                self.conv_buffer.append(
-                    alloc_func(
-                        conv_dims,
-                        dtype=self.conv_dtype,
-                        device=self.device,
-                        pin_memory=self.pin_memory,
-                        allocator=self.allocator,
-                    )
-                )
-        # Side state keeps its own dtype and its own slot axis (axis 0 of the
-        # per-layer view the device pool yields).
-        self.slot_state_buffers = [
-            alloc_func(
-                (self.size,) + tuple(state.shape[1:]),
-                dtype=state.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
-            for state in self.slot_state_device_tensors
-        ]
+        self.temporal_buffer, *state_buffers = (
+            allocate(dims, dtype) for dims, dtype in self.host_buffer_specs()
+        )
+        num_conv_buffers = len(self.conv_state_shapes)
+        self.conv_buffer = state_buffers[:num_conv_buffers]
+        self.slot_state_buffers = state_buffers[num_conv_buffers:]
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.

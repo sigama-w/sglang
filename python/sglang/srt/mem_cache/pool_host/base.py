@@ -188,6 +188,7 @@ class HostKVCache(abc.ABC):
         pool_label: str = "kv",
         is_dummy: bool = False,
         host_token_capacity: int | None = None,
+        defer_allocation: bool = False,
     ):
         """Allocate host pages from geometry prepared by the concrete host pool."""
         self.pool_label = pool_label
@@ -230,11 +231,13 @@ class HostKVCache(abc.ABC):
         self.start_layer = start_layer
         self.end_layer = end_layer
         if not is_dummy:
-            self._allocate_host_buffer()
+            self._check_host_buffer_budget()
+            if not defer_allocation:
+                self._allocate_host_buffer()
         self.lock = threading.RLock()
         self.clear()
 
-    def _allocate_host_buffer(self) -> None:
+    def _check_host_buffer_budget(self) -> None:
         if self.size <= self.device_capacity_tokens:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
@@ -277,6 +280,7 @@ class HostKVCache(abc.ABC):
                     requested_bytes / 1e9,
                 )
 
+    def _allocate_host_buffer(self) -> None:
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
 
