@@ -369,12 +369,13 @@ class TestDSV4HostViews(CustomTestCase):
                     )
                 )
 
-    def test_dsv4_acl_capacity_declares_paged_pool_block(self):
+    def test_dsv4_acl_capacity_declares_paged_pool_bytes(self):
         kvcache = SimpleNamespace(
             swa_kv_pool=SimpleNamespace(
                 kv_buffer=[object(), object()], bytes_per_page_padded=6
             )
         )
+        backend = MagicMock()
         with (
             patch.object(assembler, "is_npu", return_value=True),
             patch.object(
@@ -382,12 +383,7 @@ class TestDSV4HostViews(CustomTestCase):
                 "get_memory",
                 return_value=SimpleNamespace(hicache_mem_layout="page_first"),
             ),
-            patch.object(
-                assembler, "memfabric_host_memory_enabled", return_value=False
-            ),
-            patch.object(assembler, "acl_host_memory_enabled", return_value=True),
-            patch.object(assembler, "ensure_acl_capacity") as ensure_acl,
-            patch.object(assembler, "ensure_memfabric_capacity") as ensure_mf,
+            patch.object(assembler, "get_host_memory_backend", return_value=backend),
             patch.object(
                 torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
             ),
@@ -404,8 +400,7 @@ class TestDSV4HostViews(CustomTestCase):
                 c4_state_global_layers=[],
                 c128_layer_mapping={},
             )
-        ensure_acl.assert_called_once_with([48], 0)
-        ensure_mf.assert_not_called()
+        backend.ensure_capacity.assert_called_once_with(48, 0)
 
     def test_capacity_declares_actual_paged_and_state_allocations(self):
         def state_pool(slot_bytes):
@@ -427,10 +422,11 @@ class TestDSV4HostViews(CustomTestCase):
             "layer_first": [24, 24, 24, 16, 16, 12, 8, 8, 32, 32, 64, 64, 10, 14],
             "page_first": [72, 32, 12, 16, 64, 128, 10, 14],
         }
-        for backend in ("acl", "memfabric"):
+        for backend_name in ("acl", "memfabric"):
             for layout, blocks in expected_blocks.items():
+                backend = MagicMock(name=backend_name)
                 with (
-                    self.subTest(backend=backend, layout=layout),
+                    self.subTest(backend=backend_name, layout=layout),
                     patch.object(assembler, "is_npu", return_value=True),
                     patch.object(
                         assembler,
@@ -438,17 +434,8 @@ class TestDSV4HostViews(CustomTestCase):
                         return_value=SimpleNamespace(hicache_mem_layout=layout),
                     ),
                     patch.object(
-                        assembler,
-                        "memfabric_host_memory_enabled",
-                        return_value=backend == "memfabric",
+                        assembler, "get_host_memory_backend", return_value=backend
                     ),
-                    patch.object(
-                        assembler,
-                        "acl_host_memory_enabled",
-                        return_value=backend == "acl",
-                    ),
-                    patch.object(assembler, "ensure_acl_capacity") as ensure_acl,
-                    patch.object(assembler, "ensure_memfabric_capacity") as ensure_mf,
                     patch.object(
                         assembler,
                         "_dsv4_compressed_region_buffers",
@@ -491,20 +478,13 @@ class TestDSV4HostViews(CustomTestCase):
                         c4_state_global_layers=[0, 1],
                         c128_layer_mapping={0: 0},
                     )
-                selected, other = (
-                    (ensure_acl, ensure_mf)
-                    if backend == "acl"
-                    else (ensure_mf, ensure_acl)
-                )
-                selected.assert_called_once_with(blocks, 0)
-                other.assert_not_called()
+                backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
 
     def test_non_npu_skips_host_memory_reservation(self):
         with (
             patch.object(assembler, "is_npu", return_value=False),
             patch.object(assembler, "get_memory") as get_memory,
-            patch.object(assembler, "ensure_acl_capacity") as ensure_acl,
-            patch.object(assembler, "ensure_memfabric_capacity") as ensure_mf,
+            patch.object(assembler, "get_host_memory_backend") as get_backend,
         ):
             assembler._reserve_dsv4_paged_host_memory(
                 kvcache=None,
@@ -519,8 +499,7 @@ class TestDSV4HostViews(CustomTestCase):
                 c128_layer_mapping={},
             )
         get_memory.assert_not_called()
-        ensure_acl.assert_not_called()
-        ensure_mf.assert_not_called()
+        get_backend.assert_not_called()
 
 
 class TestC128L2Ownership(CustomTestCase):

@@ -8,7 +8,7 @@ device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
 - ``memfabric`` (MemfabricHostMemoryBackend): a MemFabric ``Offload``
   instance owns the host pool; ``pool.initialize`` reserves and
   pre-registers the whole DRAM range and ``pool.empty`` hands out blocks.
-  The HiCache host pool is allocated through the Offload instance AND the
+  The HiCache host pool is allocated through the Offload instance and the
   L2<->L1 IO uses the AIV kv_exchange kernel.
 - ``acl`` (AclHostMemoryBackend): standard CANN runtime registration
   (aclrtHostRegister with ACL_HOST_REGISTER_MAPPED, see the kernel-side
@@ -23,6 +23,7 @@ ascendc_io_enabled() gates the AIV IO path and is true for both backends.
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import torch
@@ -144,8 +145,16 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
         declaration; later host pools in the same process must fit into
         what is left.
         """
-        offload = self._get_offload()
         if not self._initialized:
+            try:
+                from sgl_kernel_npu.host_memory import set_memfabric_pool
+            except ImportError as exc:
+                raise ImportError(
+                    "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric requires sgl-kernel-npu "
+                    "with host_memory.set_memfabric_pool"
+                ) from exc
+
+            offload = self._get_offload()
             config = offload.OffloadConfig()
             config.device_id = device_id
             config.reserve_size = total_bytes
@@ -160,12 +169,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
                     f"Offload.initialize failed: ret={ret}, "
                     f"device_id={device_id}, reserve_size={total_bytes}"
                 )
-            try:
-                from sgl_kernel_npu.host_memory import set_memfabric_pool
-
-                set_memfabric_pool(self._pool)
-            except ImportError:
-                pass
+            set_memfabric_pool(self._pool)
             self._initialized = True
             self._reserved_bytes = total_bytes
             self._device_id = device_id
@@ -204,11 +208,9 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
 
         The Python-side accounting tracks the exact block byte size.
         """
-        self._get_offload()
-        numel = 1
-        for d in dims:
-            numel *= d
-        nbytes = numel * dtype.itemsize
+        if not self._initialized:
+            raise RuntimeError("MemFabric ensure_capacity must run before alloc")
+        nbytes = math.prod(dims) * dtype.itemsize
         remaining = self._reserved_bytes - self._allocated_bytes
         if nbytes > remaining:
             raise RuntimeError(

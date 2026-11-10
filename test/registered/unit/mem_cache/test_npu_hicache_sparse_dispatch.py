@@ -63,18 +63,14 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
         native = Mock(return_value="native")
         memfabric = Mock(return_value="memfabric")
         acl = Mock(return_value="acl")
-        backend = SimpleNamespace(
-            memfabric_host_memory_enabled=Mock(return_value=False),
-            acl_host_memory_enabled=Mock(return_value=False),
-            alloc_with_memfabric=memfabric,
-            alloc_with_acl=acl,
-        )
+        get_backend = Mock(return_value=None)
+        backend = SimpleNamespace(get_host_memory_backend=get_backend)
         namespace = {
             "torch": SimpleNamespace(Tensor=object, dtype=object, empty=native)
         }
         with patch.dict(
             sys.modules,
-            {"sglang.srt.mem_cache.pool_host.npu_memfabric": backend},
+            {"sglang.srt.mem_cache.pool_host.npu_host_memory": backend},
         ):
             exec(compile(module, str(path), "exec"), namespace)
             allocate = namespace["alloc_with_pin_memory_npu"]
@@ -92,13 +88,12 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
                 (2, 3), dtype="uint8", device="cpu", pin_memory=True
             )
 
-            backend.memfabric_host_memory_enabled.return_value = True
+            get_backend.return_value = SimpleNamespace(alloc=memfabric)
             self.assertEqual(allocate(**kwargs), "memfabric")
             memfabric.assert_called_once_with((2, 3), "uint8", "cpu", True, None)
             self.assertEqual(native_allocate(**kwargs), "native")
 
-            backend.memfabric_host_memory_enabled.return_value = False
-            backend.acl_host_memory_enabled.return_value = True
+            get_backend.return_value = SimpleNamespace(alloc=acl)
             self.assertEqual(allocate(**kwargs), "acl")
             acl.assert_called_once_with((2, 3), "uint8", "cpu", True, None)
 
@@ -147,8 +142,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             torch=SimpleNamespace(
                 distributed=SimpleNamespace(is_initialized=lambda: False)
             ),
-            memfabric_host_memory_enabled=lambda: False,
-            acl_host_memory_enabled=lambda: False,
+            get_host_memory_backend=lambda: None,
         )
         exec(compile(methods, str(path), "exec"), self.namespace)
         host_class = type("Host", (), {name: self.namespace[name] for name in names})
@@ -386,8 +380,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
             ALLOC_MEMORY_FUNCS={"npu": allocate},
-            ensure_memfabric_capacity=reserve,
-            memfabric_host_memory_enabled=lambda: True,
+            get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
             torch=SimpleNamespace(
                 float32="fp32",
                 empty=empty,
@@ -421,18 +414,12 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     expected_blocks.extend(
                         [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
                     )
-                    reserve.assert_called_once_with(expected_blocks, 0)
+                    reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 
     def test_acl_allocation_mirrors_component_budget(self):
-        """The acl backend allocates the same blocks as memfabric.
-
-        The only wiring difference is the allocator/declaration pair:
-        ensure_acl_capacity + alloc_with_acl replace their memfabric
-        counterparts, while the per-component byte list passed to the
-        declaration stays identical (aclrt has no GB rounding to mirror).
-        """
+        """The ACL backend receives the same component budget as MemFabric."""
         h = self.host
         h.page_num, h.layer_num, h.page_size = 8, 3, 128
         h._transfer_device = SimpleNamespace(type="npu")
@@ -443,9 +430,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
             ALLOC_MEMORY_FUNCS={"npu": allocate},
-            alloc_with_acl=allocate,
-            ensure_acl_capacity=reserve,
-            acl_host_memory_enabled=lambda: True,
+            get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
             torch=SimpleNamespace(
                 float32="fp32",
                 empty=empty,
@@ -479,7 +464,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     expected_blocks.extend(
                         [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
                     )
-                    reserve.assert_called_once_with(expected_blocks, 0)
+                    reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 
@@ -628,7 +613,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
             namespace,
         )
-        backend_path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_memfabric.py"
+        backend_path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
         backend_functions = [
             node
             for node in ast.parse(backend_path.read_text()).body
@@ -671,7 +656,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                         patch.dict(
                             sys.modules,
                             {
-                                "sglang.srt.mem_cache.pool_host.npu_memfabric": SimpleNamespace(
+                                "sglang.srt.mem_cache.pool_host.npu_host_memory": SimpleNamespace(
                                     ascendc_io_enabled=backend_namespace[
                                         "ascendc_io_enabled"
                                     ],
