@@ -414,9 +414,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         native = self._native_buffers
         num_indexer_layers = len(native.index_layer_indices)
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
-        k_width = (
-            native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
-        )
+        k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
 
         backend = get_host_memory_backend()
