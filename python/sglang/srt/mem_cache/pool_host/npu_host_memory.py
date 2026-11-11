@@ -12,10 +12,11 @@ device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
   L2<->L1 IO uses the AIV kv_exchange kernel.
 - ``acl`` (AclHostMemoryBackend): standard CANN runtime registration
   (aclrtHostRegister with ACL_HOST_REGISTER_MAPPED, see the kernel-side
-  ``host_memory`` module).  Plain pageable host tensors are allocated
-  with torch.empty and registered so the AIV kv_exchange kernel can
-  resolve their device pointers. The kernel-side auto routing sends every
-  transfer to the AIV operator.
+  ``host_memory`` module).  Host blocks come from the shared mmap
+  allocator (alloc_mmap), so SGLANG_HUGEPAGE_SIZE (2MB/1GB hugetlb
+  pages) applies to the host pool; blocks are registered so the AIV
+  kv_exchange kernel can resolve their device pointers. The kernel-side
+  auto routing sends every transfer to the AIV operator.
 
 ascendc_io_enabled() gates the AIV IO path and is true for both backends.
 """
@@ -26,10 +27,13 @@ import logging
 import math
 import os
 from collections.abc import Callable
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
 
@@ -52,8 +56,17 @@ def memfabric_host_memory_enabled() -> bool:
 
 
 def acl_host_memory_enabled() -> bool:
-    """aclrtHostRegister backs the host pool (pageable torch.empty blocks)."""
+    """aclrtHostRegister backs the host pool (mmap-backed host blocks)."""
     return host_memory_backend() == "acl"
+
+
+@lru_cache(maxsize=1)
+def _log_acl_mmap_host_pool() -> None:
+    logger.info(
+        "SGLANG_HICACHE_HOST_MEM_BACKEND=acl: host blocks come from the "
+        "mmap allocator (SGLANG_HUGEPAGE_SIZE=%r).",
+        envs.SGLANG_HUGEPAGE_SIZE.get() or "",
+    )
 
 
 def ascendc_io_enabled() -> bool:
@@ -238,14 +251,17 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
 
 
 class AclHostMemoryBackend(NpuHostMemoryBackend):
-    """Pageable torch.empty blocks registered with aclrtHostRegister.
+    """mmap-backed host blocks registered with aclrtHostRegister.
 
-    Standard CANN runtime registration: plain pageable host pages are
-    mapped into the device VA space by aclrtHostRegister(ACL_HOST_REGISTER_MAPPED)
+    Standard CANN runtime registration: host blocks allocated by the
+    shared mmap allocator (alloc_mmap, honoring SGLANG_HUGEPAGE_SIZE
+    hugetlb pages with a prefaulted plain-mmap fallback) are mapped into
+    the device VA space by aclrtHostRegister(ACL_HOST_REGISTER_MAPPED)
     inside the kernel-side ``host_memory`` module.  There is no
-    pre-reserved entity and nothing to declare up front, so ensure_capacity
-    stays the inherited no-op; the kernel-side host_memory table resolves
-    interior views by byte offset at transfer time.
+    pre-reserved entity and nothing to declare up front, so
+    ensure_capacity stays the inherited no-op; the kernel-side
+    host_memory table resolves interior views by byte offset at transfer
+    time.
     """
 
     def _register_block(self, tensor: torch.Tensor) -> None:
@@ -269,8 +285,15 @@ class AclHostMemoryBackend(NpuHostMemoryBackend):
         pin_memory: bool,
         allocator: None,
     ) -> torch.Tensor:
-        """Allocate one pageable host block and map it for NPU access."""
-        tensor = torch.empty(list(dims), dtype=dtype)
+        """Allocate one mmap-backed host block and map it for NPU access.
+
+        Memory comes from alloc_mmap, so SGLANG_HUGEPAGE_SIZE selects
+        2MB/1GB hugetlb pages (prefaulted 4KB mmap when unset or on
+        allocation failure); the registration path is identical for
+        every page size.
+        """
+        _log_acl_mmap_host_pool()
+        tensor = alloc_mmap(tuple(dims), dtype)
         self._register_block(tensor)
         return tensor
 
