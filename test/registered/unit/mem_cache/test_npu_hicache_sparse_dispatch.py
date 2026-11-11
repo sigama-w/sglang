@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import math
 import os
 import sys
 import unittest
@@ -133,7 +132,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 n
                 for n in backend_tree.body
                 if isinstance(n, ast.FunctionDef)
-                and n.name == "reserve_npu_host_memory"
+                and n.name == "reserve_mla_split_host_memory"
             )
         )
         self.ops = {
@@ -149,7 +148,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.namespace = dict(
             self.ops,
             _is_npu=True,
-            math=math,
             maybe_dcp_kernel_indices=self.localize,
             logger=Mock(),
             torch=SimpleNamespace(
@@ -416,7 +414,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ALLOC_MEMORY_FUNCS={"npu": allocate},
             get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
             torch=SimpleNamespace(
-                float32=SimpleNamespace(itemsize=4),
+                float32="fp32",
                 empty=empty,
                 npu=SimpleNamespace(current_device=lambda: 0),
             ),
@@ -466,7 +464,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ALLOC_MEMORY_FUNCS={"npu": allocate},
             get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
             torch=SimpleNamespace(
-                float32=SimpleNamespace(itemsize=4),
+                float32="fp32",
                 empty=empty,
                 npu=SimpleNamespace(current_device=lambda: 0),
             ),

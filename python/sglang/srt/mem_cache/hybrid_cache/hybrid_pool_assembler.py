@@ -34,8 +34,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    get_host_memory_backend,
-    reserve_npu_host_memory,
+    reserve_dsv4_paged_host_memory,
 )
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -940,79 +939,6 @@ def _build_dsv4_rope_entry(
     )
 
 
-def _reserve_dsv4_paged_host_memory(
-    *,
-    kvcache: Any,
-    page_size: int,
-    num_host_pages: int,
-    swa_num_host_pages: int,
-    c128_num_host_pages: int,
-    has_paged_swa: bool,
-    mtp_swa_device_buffers: list,
-    c4_layer_mapping: dict[int, int],
-    c4_state_global_layers: list[int],
-    c128_layer_mapping: dict[int, int],
-) -> None:
-    if not is_npu():
-        return
-
-    import torch
-
-    # Describe all DSV4 paged host blocks before constructing the SWA pool.
-    buffer_specs = []
-    layer_first = get_memory().hicache_mem_layout == "layer_first"
-
-    def add_blocks(pages, layer_page_bytes):
-        if not layer_page_bytes:
-            return
-        if layer_first:
-            buffer_specs.extend(
-                ((pages, page_bytes), torch.uint8) for page_bytes in layer_page_bytes
-            )
-        else:
-            # A page-first row contains the payloads for all layers.
-            buffer_specs.append(((pages, sum(layer_page_bytes)), torch.uint8))
-
-    def add_paged(buffers, item_bytes, pages):
-        add_blocks(pages, [item_bytes] * len(buffers))
-
-    if has_paged_swa:
-        add_paged(
-            [*kvcache.swa_kv_pool.kv_buffer, *mtp_swa_device_buffers],
-            kvcache.swa_kv_pool.bytes_per_page_padded,
-            swa_num_host_pages,
-        )
-    if c4_layer_mapping:
-        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
-        add_paged(buffers, item_bytes, num_host_pages)
-        for region in _dsv4_indexer_regions(kvcache, page_size):
-            add_paged(region.device_buffers, region.item_bytes, num_host_pages)
-        sibling = _dsv4_rope_sibling(kvcache, 4)
-        if sibling is not None:
-            add_paged(sibling[1], sibling[2], num_host_pages)
-        if not getattr(kvcache, "_unified_kv", False):
-            for state_pools in (
-                kvcache.compress_state_pools,
-                kvcache.indexer_compress_state_pools,
-            ):
-                state_page_bytes = []
-                for layer_id in c4_state_global_layers:
-                    pool = state_pools[layer_id]
-                    state_page_bytes.append(
-                        pool.ring_size * pool.kv_score_buffer.kv_score[0].nbytes
-                    )
-                add_blocks(swa_num_host_pages, state_page_bytes)
-    if c128_layer_mapping:
-        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 128)
-        add_paged(buffers, item_bytes, c128_num_host_pages)
-        sibling = _dsv4_rope_sibling(kvcache, 128)
-        if sibling is not None:
-            add_paged(sibling[1], sibling[2], c128_num_host_pages)
-    backend = get_host_memory_backend()
-    if buffer_specs and backend is not None:
-        reserve_npu_host_memory(backend, buffer_specs)
-
-
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -1081,7 +1007,7 @@ def build_deepseek_v4_hicache_stack(
         swa_page_size=kvcache.swa_page_size,
     )
 
-    _reserve_dsv4_paged_host_memory(
+    reserve_dsv4_paged_host_memory(
         kvcache=kvcache,
         page_size=page_size,
         num_host_pages=num_host_pages,
@@ -1092,6 +1018,9 @@ def build_deepseek_v4_hicache_stack(
         c4_layer_mapping=c4_layer_mapping,
         c4_state_global_layers=c4_state_global_layers,
         c128_layer_mapping=c128_layer_mapping,
+        compressed_region_buffers=_dsv4_compressed_region_buffers,
+        indexer_regions=_dsv4_indexer_regions,
+        rope_sibling=_dsv4_rope_sibling,
     )
 
     logical_host_pool = LogicalHostPool(

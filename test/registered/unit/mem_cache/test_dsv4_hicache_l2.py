@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import npu_host_memory
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
@@ -377,18 +378,20 @@ class TestDSV4HostViews(CustomTestCase):
         )
         backend = MagicMock()
         with (
-            patch.object(assembler, "is_npu", return_value=True),
+            patch.object(npu_host_memory, "is_npu", return_value=True),
             patch.object(
-                assembler,
+                npu_host_memory,
                 "get_memory",
                 return_value=SimpleNamespace(hicache_mem_layout="page_first"),
             ),
-            patch.object(assembler, "get_host_memory_backend", return_value=backend),
+            patch.object(
+                npu_host_memory, "get_host_memory_backend", return_value=backend
+            ),
             patch.object(
                 torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
             ),
         ):
-            assembler._reserve_dsv4_paged_host_memory(
+            npu_host_memory.reserve_dsv4_paged_host_memory(
                 kvcache=kvcache,
                 page_size=4,
                 num_host_pages=4,
@@ -399,6 +402,9 @@ class TestDSV4HostViews(CustomTestCase):
                 c4_layer_mapping={},
                 c4_state_global_layers=[],
                 c128_layer_mapping={},
+                compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
+                indexer_regions=assembler._dsv4_indexer_regions,
+                rope_sibling=assembler._dsv4_rope_sibling,
             )
         backend.ensure_capacity.assert_called_once_with(48, 0)
 
@@ -427,14 +433,14 @@ class TestDSV4HostViews(CustomTestCase):
                 backend = MagicMock(name=backend_name)
                 with (
                     self.subTest(backend=backend_name, layout=layout),
-                    patch.object(assembler, "is_npu", return_value=True),
+                    patch.object(npu_host_memory, "is_npu", return_value=True),
                     patch.object(
-                        assembler,
+                        npu_host_memory,
                         "get_memory",
                         return_value=SimpleNamespace(hicache_mem_layout=layout),
                     ),
                     patch.object(
-                        assembler, "get_host_memory_backend", return_value=backend
+                        npu_host_memory, "get_host_memory_backend", return_value=backend
                     ),
                     patch.object(
                         assembler,
@@ -466,7 +472,7 @@ class TestDSV4HostViews(CustomTestCase):
                         create=True,
                     ),
                 ):
-                    assembler._reserve_dsv4_paged_host_memory(
+                    npu_host_memory.reserve_dsv4_paged_host_memory(
                         kvcache=kvcache,
                         page_size=4,
                         num_host_pages=4,
@@ -477,16 +483,19 @@ class TestDSV4HostViews(CustomTestCase):
                         c4_layer_mapping={0: 0, 1: 1},
                         c4_state_global_layers=[0, 1],
                         c128_layer_mapping={0: 0},
+                        compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
+                        indexer_regions=assembler._dsv4_indexer_regions,
+                        rope_sibling=assembler._dsv4_rope_sibling,
                     )
                 backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
 
     def test_non_npu_skips_host_memory_reservation(self):
         with (
-            patch.object(assembler, "is_npu", return_value=False),
-            patch.object(assembler, "get_memory") as get_memory,
-            patch.object(assembler, "get_host_memory_backend") as get_backend,
+            patch.object(npu_host_memory, "is_npu", return_value=False),
+            patch.object(npu_host_memory, "get_memory") as get_memory,
+            patch.object(npu_host_memory, "get_host_memory_backend") as get_backend,
         ):
-            assembler._reserve_dsv4_paged_host_memory(
+            npu_host_memory.reserve_dsv4_paged_host_memory(
                 kvcache=None,
                 page_size=4,
                 num_host_pages=0,
@@ -497,6 +506,9 @@ class TestDSV4HostViews(CustomTestCase):
                 c4_layer_mapping={},
                 c4_state_global_layers=[],
                 c128_layer_mapping={},
+                compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
+                indexer_regions=assembler._dsv4_indexer_regions,
+                rope_sibling=assembler._dsv4_rope_sibling,
             )
         get_memory.assert_not_called()
         get_backend.assert_not_called()

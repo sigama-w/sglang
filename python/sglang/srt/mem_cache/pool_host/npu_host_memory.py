@@ -26,13 +26,19 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Iterable
+from collections.abc import Callable
 from functools import lru_cache
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from sglang.srt import environ as envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.runtime_context import get_memory
+from sglang.srt.utils import is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
 
 logger = logging.getLogger(__name__)
 
@@ -306,13 +312,112 @@ def get_host_memory_backend() -> NpuHostMemoryBackend | None:
     return _backend
 
 
-def reserve_npu_host_memory(
-    backend: NpuHostMemoryBackend,
-    buffers: Iterable[tuple[tuple[int, ...], torch.dtype]],
+def reserve_mla_split_host_memory(
+    *,
+    num_pages: int,
+    page_size: int,
+    num_layers: int,
+    k_width: int,
+    v_width: int,
+    dtype: torch.dtype,
+    buffers: MLASplitBuffers,
 ) -> None:
-    """Reserve the combined size of the host buffers before allocation."""
-    total_bytes = sum(math.prod(shape) * dtype.itemsize for shape, dtype in buffers)
+    """Reserve the split MLA host buffers before allocating them."""
+    backend = get_host_memory_backend()
+    if backend is None:
+        return
+
+    num_tokens = num_pages * page_size
+    num_kv_rows = num_tokens * num_layers
+    total_bytes = num_kv_rows * k_width * dtype.itemsize
+    if v_width > 0:
+        total_bytes += num_kv_rows * v_width * dtype.itemsize
+
+    num_indexer_rows = num_tokens * len(buffers.index_layer_indices)
+    if buffers.index_k is not None:
+        total_bytes += num_indexer_rows * buffers.index_width * dtype.itemsize
+    if buffers.index_scales is not None:
+        total_bytes += num_indexer_rows * 4  # Host scales are FP32.
+
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
+
+
+def reserve_dsv4_paged_host_memory(
+    *,
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    swa_num_host_pages: int,
+    c128_num_host_pages: int,
+    has_paged_swa: bool,
+    mtp_swa_device_buffers: list,
+    c4_layer_mapping: dict[int, int],
+    c4_state_global_layers: list[int],
+    c128_layer_mapping: dict[int, int],
+    compressed_region_buffers: Callable[[Any, int], tuple[list, int]],
+    indexer_regions: Callable[[Any, int], list],
+    rope_sibling: Callable[[Any, int], tuple[Any, list, int] | None],
+) -> None:
+    """Reserve DSV4 paged buffers before constructing the host pools."""
+    if not is_npu():
+        return
+
+    # Declare every DSV4 paged host block before constructing the SWA pool.
+    # Per-block byte sizes; MemFabric fixes its reservation at the first
+    # declaration, so the blocks are summed before declaring.
+    paged_blocks = []
+    layer_first = get_memory().hicache_mem_layout == "layer_first"
+
+    def add_blocks(layer_bytes):
+        if not layer_bytes:
+            return
+        # Match actual allocator calls: one block per layer for layer_first,
+        # one block for the entire pool for page-first layouts.
+        if layer_first:
+            paged_blocks.extend(layer_bytes)
+        else:
+            paged_blocks.append(sum(layer_bytes))
+
+    def add_paged(buffers, item_bytes, pages):
+        add_blocks([pages * item_bytes] * len(buffers))
+
+    if has_paged_swa:
+        add_paged(
+            [*kvcache.swa_kv_pool.kv_buffer, *mtp_swa_device_buffers],
+            kvcache.swa_kv_pool.bytes_per_page_padded,
+            swa_num_host_pages,
+        )
+    if c4_layer_mapping:
+        buffers, item_bytes = compressed_region_buffers(kvcache, 4)
+        add_paged(buffers, item_bytes, num_host_pages)
+        for region in indexer_regions(kvcache, page_size):
+            add_paged(region.device_buffers, region.item_bytes, num_host_pages)
+        sibling = rope_sibling(kvcache, 4)
+        if sibling is not None:
+            add_paged(sibling[1], sibling[2], num_host_pages)
+        if not getattr(kvcache, "_unified_kv", False):
+            for state_pools in (
+                kvcache.compress_state_pools,
+                kvcache.indexer_compress_state_pools,
+            ):
+                state_blocks = []
+                for layer_id in c4_state_global_layers:
+                    pool = state_pools[layer_id]
+                    state_blocks.append(
+                        swa_num_host_pages
+                        * pool.ring_size
+                        * pool.kv_score_buffer.kv_score[0].nbytes
+                    )
+                add_blocks(state_blocks)
+    if c128_layer_mapping:
+        buffers, item_bytes = compressed_region_buffers(kvcache, 128)
+        add_paged(buffers, item_bytes, c128_num_host_pages)
+        sibling = rope_sibling(kvcache, 128)
+        if sibling is not None:
+            add_paged(sibling[1], sibling[2], c128_num_host_pages)
+    backend = get_host_memory_backend()
+    if paged_blocks and backend is not None:
+        backend.ensure_capacity(sum(paged_blocks), torch.npu.current_device())
 
 
 # ---------------------------------------------------------------------------
