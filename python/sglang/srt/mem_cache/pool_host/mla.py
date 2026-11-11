@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
+from sglang.srt.mem_cache.pool_host.npu_host_memory import reserve_mla_split_host_memory
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -412,43 +412,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         zero-element empty tensor because FP8 DSA packs V into K.
         """
         native = self._native_buffers
-        num_indexer_layers = len(native.index_layer_indices)
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
 
-        backend = get_host_memory_backend()
-        if backend is not None:
-            # Declare the combined block budget up front. MemFabric fixes its
-            # entity reservation at the first declaration; the aclrt path
-            # registers each block at allocation time and keeps the no-op.
-            total_bytes = (
-                self.page_num
-                * self.page_size
-                * self.layer_num
-                * k_width
-                * self.dtype.itemsize
-            )
-            if v_width > 0:
-                total_bytes += (
-                    self.page_num
-                    * self.page_size
-                    * self.layer_num
-                    * v_width
-                    * self.dtype.itemsize
-                )
-            if native.index_k is not None:
-                total_bytes += (
-                    self.page_num
-                    * self.page_size
-                    * num_indexer_layers
-                    * native.index_width
-                    * self.dtype.itemsize
-                )
-            if native.index_scales is not None:
-                # FP32 scale mirror
-                total_bytes += self.page_num * self.page_size * num_indexer_layers * 4
-            backend.ensure_capacity(total_bytes, torch.npu.current_device())
+        reserve_mla_split_host_memory(
+            num_pages=self.page_num,
+            page_size=self.page_size,
+            num_layers=self.layer_num,
+            k_width=k_width,
+            v_width=v_width,
+            dtype=self.dtype,
+            buffers=native,
+        )
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
             dtype=self.dtype,

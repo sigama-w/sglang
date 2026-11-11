@@ -1,5 +1,7 @@
 """Exercise real MLA PF/LF routing and layer ownership without an NPU runtime."""
 
+from __future__ import annotations
+
 import ast
 import os
 import sys
@@ -123,6 +125,15 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 if isinstance(n, ast.FunctionDef) and n.name in names
             ],
             type_ignores=[],
+        )
+        backend_tree = ast.parse(path.with_name("npu_host_memory.py").read_text())
+        methods.body.append(
+            next(
+                n
+                for n in backend_tree.body
+                if isinstance(n, ast.FunctionDef)
+                and n.name == "reserve_mla_split_host_memory"
+            )
         )
         self.ops = {
             name: Mock(name=name)
