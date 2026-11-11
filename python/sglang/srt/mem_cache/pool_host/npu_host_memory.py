@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from sglang.srt import environ as envs
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
