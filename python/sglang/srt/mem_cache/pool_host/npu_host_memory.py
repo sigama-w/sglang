@@ -12,7 +12,7 @@ device VA space first.  SGLANG_HICACHE_HOST_MEM_BACKEND selects the backend
   L2<->L1 IO uses the AIV kv_exchange kernel.
 - ``acl`` (AclHostMemoryBackend): standard CANN runtime registration
   (aclrtHostRegister with ACL_HOST_REGISTER_MAPPED, see the kernel-side
-  sgl_kernel_npu.host_memory).  Host blocks come from the shared mmap
+  ``host_memory`` module).  Host blocks come from the shared mmap
   allocator (alloc_mmap), so SGLANG_HUGEPAGE_SIZE (2MB/1GB hugetlb
   pages) applies to the host pool; blocks are registered so the AIV
   kv_exchange kernel can resolve their device pointers. The kernel-side
@@ -113,7 +113,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
     every ``pool.malloc``/``pool.empty`` block is device-visible immediately
     (16-byte-bump allocation, no per-block GB rounding), and
     ``pool.host_register`` on a block is an idempotent in-pool check.  The
-    instance is published to sgl_kernel_npu.host_memory (set_memfabric_pool)
+    instance is published via the kernel-side ``set_memfabric_pool``
     so its register/get-device-pointer calls resolve through the same pool.
     """
 
@@ -148,7 +148,9 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
         offset at transfer time.
         """
         try:
-            from sgl_kernel_npu.host_memory import register_host_memory
+            from sgl_kernel_npu.operators.mem_cache.memfabric.host_memory import (
+                register_host_memory,
+            )
         except ImportError as exc:
             raise ImportError(
                 "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric requires sgl-kernel-npu "
@@ -168,7 +170,9 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
         """
         if not self._initialized:
             try:
-                from sgl_kernel_npu.host_memory import set_memfabric_pool
+                from sgl_kernel_npu.operators.mem_cache.memfabric.host_memory import (
+                    set_memfabric_pool,
+                )
             except ImportError as exc:
                 raise ImportError(
                     "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric requires sgl-kernel-npu "
@@ -253,8 +257,8 @@ class AclHostMemoryBackend(NpuHostMemoryBackend):
     shared mmap allocator (alloc_mmap, honoring SGLANG_HUGEPAGE_SIZE
     hugetlb pages with a prefaulted plain-mmap fallback) are mapped into
     the device VA space by aclrtHostRegister(ACL_HOST_REGISTER_MAPPED)
-    inside the kernel-side sgl_kernel_npu.host_memory module.  There is
-    no pre-reserved entity and nothing to declare up front, so
+    inside the kernel-side ``host_memory`` module.  There is no
+    pre-reserved entity and nothing to declare up front, so
     ensure_capacity stays the inherited no-op; the kernel-side
     host_memory table resolves interior views by byte offset at transfer
     time.
@@ -262,7 +266,9 @@ class AclHostMemoryBackend(NpuHostMemoryBackend):
 
     def _register_block(self, tensor: torch.Tensor) -> None:
         try:
-            from sgl_kernel_npu.host_memory import register_acl_host_memory
+            from sgl_kernel_npu.operators.mem_cache.memfabric.host_memory import (
+                register_acl_host_memory,
+            )
         except ImportError as exc:
             raise ImportError(
                 "SGLANG_HICACHE_HOST_MEM_BACKEND=acl requires sgl-kernel-npu "
