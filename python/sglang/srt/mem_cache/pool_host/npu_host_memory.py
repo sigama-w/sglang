@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections.abc import Iterable
 
 import torch
 
@@ -279,6 +280,15 @@ def get_host_memory_backend() -> NpuHostMemoryBackend | None:
         elif acl_host_memory_enabled():
             _backend = AclHostMemoryBackend()
     return _backend
+
+
+def reserve_npu_host_memory(
+    backend: NpuHostMemoryBackend,
+    buffers: Iterable[tuple[tuple[int, ...], torch.dtype]],
+) -> None:
+    """Reserve the combined size of the host buffers before allocation."""
+    total_bytes = sum(math.prod(shape) * dtype.itemsize for shape, dtype in buffers)
+    backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
 # ---------------------------------------------------------------------------
