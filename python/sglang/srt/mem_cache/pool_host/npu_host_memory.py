@@ -281,21 +281,6 @@ def get_host_memory_backend() -> NpuHostMemoryBackend | None:
     return _backend
 
 
-def allocate_memfabric_host_pools(*pools) -> None:
-    """Reserve all host blocks before allocating any pool in the group."""
-    total_bytes = sum(
-        math.prod(dims) * dtype.itemsize
-        for pool in pools
-        for dims, dtype in pool.host_buffer_specs()
-    )
-    if total_bytes:
-        get_host_memory_backend().ensure_capacity(
-            total_bytes, torch.npu.current_device()
-        )
-    for pool in pools:
-        pool.allocate_host_buffers()
-
-
 # ---------------------------------------------------------------------------
 # Sync-free H2D upload (NPU)
 #

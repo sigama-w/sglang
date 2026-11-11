@@ -34,8 +34,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    allocate_memfabric_host_pools,
-    memfabric_host_memory_enabled,
+    get_host_memory_backend,
 )
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -170,7 +169,6 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
-    defer_allocation: bool = False,
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
@@ -195,7 +193,6 @@ def build_kv_host_pool(
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
         kwargs.update(
-            defer_allocation=defer_allocation,
             device_capacity_tokens=kv_pool.size
             if kv_pool.host_capacity_tokens is None
             else kv_pool.host_capacity_tokens,
@@ -862,12 +859,7 @@ def _dsv4_low_ratio_regions(
 
 
 def _dsv4_low_ratio_entries(
-    kvcache: Any,
-    page_size: int,
-    num_host_pages: int,
-    transfer_layer_id_max: int,
-    *,
-    defer_allocation: bool = False,
+    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_id_max: int
 ):
     """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
     entries = []
@@ -886,7 +878,6 @@ def _dsv4_low_ratio_entries(
                     layout=get_memory().hicache_mem_layout,
                     allocator_type=_get_allocator_type(),
                     page_aligned_only=True,
-                    defer_allocation=defer_allocation,
                 ),
                 device_pool=device_pool,
                 layer_mapping=layer_mapping,
@@ -925,7 +916,6 @@ def _build_dsv4_rope_entry(
     num_host_pages: int,
     slot_page_size: int,
     transfer_layer_id_max: int,
-    defer_allocation: bool = False,
 ) -> Optional[PoolEntry]:
     sibling = _dsv4_rope_sibling(kvcache, ratio)
     if sibling is None:
@@ -942,12 +932,87 @@ def _build_dsv4_rope_entry(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=True,
-            defer_allocation=defer_allocation,
         ),
         device_pool=device_pool,
         layer_mapping=layer_mapping,
         transfer_layer_id_max=transfer_layer_id_max,
     )
+
+
+def _reserve_dsv4_paged_host_memory(
+    *,
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    swa_num_host_pages: int,
+    c128_num_host_pages: int,
+    has_paged_swa: bool,
+    mtp_swa_device_buffers: list,
+    c4_layer_mapping: dict[int, int],
+    c4_state_global_layers: list[int],
+    c128_layer_mapping: dict[int, int],
+) -> None:
+    if not is_npu():
+        return
+
+    import torch
+
+    # Declare every DSV4 paged host block before constructing the SWA pool.
+    # Per-block byte sizes; MemFabric fixes its reservation at the first
+    # declaration, so the blocks are summed before declaring.
+    paged_blocks = []
+    layer_first = get_memory().hicache_mem_layout == "layer_first"
+
+    def add_blocks(layer_bytes):
+        if not layer_bytes:
+            return
+        # Match actual allocator calls: one block per layer for layer_first,
+        # one block for the entire pool for page-first layouts.
+        if layer_first:
+            paged_blocks.extend(layer_bytes)
+        else:
+            paged_blocks.append(sum(layer_bytes))
+
+    def add_paged(buffers, item_bytes, pages):
+        add_blocks([pages * item_bytes] * len(buffers))
+
+    if has_paged_swa:
+        add_paged(
+            [*kvcache.swa_kv_pool.kv_buffer, *mtp_swa_device_buffers],
+            kvcache.swa_kv_pool.bytes_per_page_padded,
+            swa_num_host_pages,
+        )
+    if c4_layer_mapping:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
+        add_paged(buffers, item_bytes, num_host_pages)
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            add_paged(region.device_buffers, region.item_bytes, num_host_pages)
+        sibling = _dsv4_rope_sibling(kvcache, 4)
+        if sibling is not None:
+            add_paged(sibling[1], sibling[2], num_host_pages)
+        if not getattr(kvcache, "_unified_kv", False):
+            for state_pools in (
+                kvcache.compress_state_pools,
+                kvcache.indexer_compress_state_pools,
+            ):
+                state_blocks = []
+                for layer_id in c4_state_global_layers:
+                    pool = state_pools[layer_id]
+                    state_blocks.append(
+                        swa_num_host_pages
+                        * pool.ring_size
+                        * pool.kv_score_buffer.kv_score[0].nbytes
+                    )
+                add_blocks(state_blocks)
+    if c128_layer_mapping:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 128)
+        add_paged(buffers, item_bytes, c128_num_host_pages)
+        sibling = _dsv4_rope_sibling(kvcache, 128)
+        if sibling is not None:
+            add_paged(sibling[1], sibling[2], c128_num_host_pages)
+    backend = get_host_memory_backend()
+    if paged_blocks and backend is not None:
+        backend.ensure_capacity(sum(paged_blocks), torch.npu.current_device())
 
 
 def build_deepseek_v4_hicache_stack(
@@ -1018,7 +1083,18 @@ def build_deepseek_v4_hicache_stack(
         swa_page_size=kvcache.swa_page_size,
     )
 
-    defer_allocation = is_npu() and memfabric_host_memory_enabled()
+    _reserve_dsv4_paged_host_memory(
+        kvcache=kvcache,
+        page_size=page_size,
+        num_host_pages=num_host_pages,
+        swa_num_host_pages=swa_num_host_pages,
+        c128_num_host_pages=c128_num_host_pages,
+        has_paged_swa=has_paged_swa,
+        mtp_swa_device_buffers=mtp_swa_device_buffers,
+        c4_layer_mapping=c4_layer_mapping,
+        c4_state_global_layers=c4_state_global_layers,
+        c128_layer_mapping=c128_layer_mapping,
+    )
 
     logical_host_pool = LogicalHostPool(
         num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
@@ -1047,7 +1123,6 @@ def build_deepseek_v4_hicache_stack(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
-            defer_allocation=defer_allocation,
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
@@ -1081,7 +1156,6 @@ def build_deepseek_v4_hicache_stack(
             allocator_type=_get_allocator_type(),
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c4_kv_pool),
-            defer_allocation=defer_allocation,
         )
         entries.append(
             build_pool_entry(
@@ -1105,7 +1179,6 @@ def build_deepseek_v4_hicache_stack(
                         layout=get_memory().hicache_mem_layout,
                         allocator_type=_get_allocator_type(),
                         page_aligned_only=region.page_aligned_only,
-                        defer_allocation=defer_allocation,
                     ),
                     device_pool=kvcache.c4_indexer_kv_pool,
                     layer_mapping=c4_layer_mapping,
@@ -1122,7 +1195,6 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             transfer_layer_id_max=transfer_layer_id_max,
-            defer_allocation=defer_allocation,
         )
         if c4_rope_entry is not None:
             entries.append(c4_rope_entry)
@@ -1138,7 +1210,6 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
-                defer_allocation=defer_allocation,
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -1150,7 +1221,6 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
-                defer_allocation=defer_allocation,
             )
             entries.extend(
                 [
@@ -1193,7 +1263,6 @@ def build_deepseek_v4_hicache_stack(
             allocator_type=_get_allocator_type(),
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c128_kv_pool),
-            defer_allocation=defer_allocation,
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -1231,23 +1300,15 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=c128_num_host_pages,
             slot_page_size=c128_slot_page_size,
             transfer_layer_id_max=transfer_layer_id_max,
-            defer_allocation=defer_allocation,
         )
         if c128_rope_entry is not None:
             entries.append(c128_rope_entry)
 
     entries.extend(
         _dsv4_low_ratio_entries(
-            kvcache,
-            page_size,
-            num_host_pages,
-            transfer_layer_id_max,
-            defer_allocation=defer_allocation,
+            kvcache, page_size, num_host_pages, transfer_layer_id_max
         )
     )
-    if defer_allocation:
-        # The logical anchor owns indices only and allocates no backing memory.
-        allocate_memfabric_host_pools(*(entry.host_pool for entry in entries[1:]))
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
@@ -1279,7 +1340,6 @@ def build_mamba_host_pool(
     host_size: float,
     layout: str,
     mtp_draft_device_pools=(),
-    defer_allocation: bool = False,
 ):
     draft_buffer_infos = []
     for draft_pool in mtp_draft_device_pools:
@@ -1297,7 +1357,6 @@ def build_mamba_host_pool(
         mtp_draft_buffer_infos=draft_buffer_infos,
         allocator_type=_get_allocator_type(),
         layout=layout,
-        defer_allocation=defer_allocation,
     )
 
 
@@ -1354,30 +1413,30 @@ def build_hybrid_mamba_stack(
             for b in pool.qsa_compressed_k_buffer_pool
         )
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
-    kv_layout = get_memory().hicache_mem_layout
-    split_kv = kv_layout in ("page_first_kv_split", "layer_first_kv_split")
-    # Mamba/KDA state uses a direct layout alongside split MLA KV.
-    mamba_kwargs = dict(
-        host_size=mamba_host_size,
-        layout="page_first_direct" if split_kv else kv_layout,
-        mtp_draft_device_pools=params.mtp_draft_mamba_pools,
-    )
-    defer_allocation = (
-        is_npu() and use_mla and split_kv and memfabric_host_memory_enabled()
-    )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
-        defer_allocation=defer_allocation,
+    )
+    # MambaPoolHost only supports page_first_direct; the global layout may be
+    # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
+    # pool has no separate K/V buffers, so kv_split does not apply; override
+    # to page_first_direct.
+    mamba_layout = (
+        "page_first_direct"
+        if get_memory().hicache_mem_layout
+        in ("page_first_kv_split", "layer_first_kv_split")
+        else get_memory().hicache_mem_layout
     )
     mamba_host_pool = build_mamba_host_pool(
-        mamba_pool, mamba_info, defer_allocation=defer_allocation, **mamba_kwargs
+        mamba_pool,
+        mamba_info,
+        host_size=mamba_host_size,
+        layout=mamba_layout,
+        mtp_draft_device_pools=params.mtp_draft_mamba_pools,
     )
-    if defer_allocation:
-        allocate_memfabric_host_pools(kv_host_pool, mamba_host_pool)
     mamba_layer_mapping = with_packed_draft_layer_mapping(
         mamba_layer_mapping,
         transfer_layer_start=transfer_layer_id_max,

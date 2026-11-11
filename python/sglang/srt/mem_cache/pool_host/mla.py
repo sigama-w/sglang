@@ -34,10 +34,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    allocate_memfabric_host_pools,
-    memfabric_host_memory_enabled,
-)
+from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -119,7 +116,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         layer_shard_enabled: bool = False,
         pool_label: str = "kv",
         host_token_capacity: int | None = None,
-        defer_allocation: bool = False,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
@@ -222,12 +218,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     if draft_buffer_infos
                     else buffer_info.data_ptrs
                 )
-        uses_memfabric = (
-            self._native_buffers is not None
-            and self._transfer_device.type == "npu"
-            and layout in ("page_first_kv_split", "layer_first_kv_split")
-            and memfabric_host_memory_enabled()
-        )
         super().__init__(
             dtype=self.dtype,
             device_capacity_tokens=device_capacity_tokens,
@@ -246,7 +236,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
             is_dummy=self._is_dummy,
-            defer_allocation=defer_allocation or uses_memfabric,
         )
         if self._is_dummy:
             self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
@@ -266,18 +255,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             return
 
-        if defer_allocation:
-            return
-        if uses_memfabric:
-            allocate_memfabric_host_pools(self)
-        else:
-            self._init_host_transfer_views()
-
-    def allocate_host_buffers(self) -> None:
-        self._allocate_host_buffer()
-        self._init_host_transfer_views()
-
-    def _init_host_transfer_views(self) -> None:
         self._initialize_transfer_views()
         if self._native_buffers is not None and self.layout in (
             "page_first_kv_split",
@@ -371,8 +348,41 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 is_mla=True,
             )
             dims = self.page_unified_layout.page_dims(self.page_num)
-        elif self.layout in ("layer_first_kv_split", "page_first_kv_split"):
-            return self._init_kv_split_buffer()
+        # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
+        # Separately allocate k_buffer and v_buffer for easier data transfer.
+        elif self.layout == "layer_first_kv_split":
+            # NPU AscendC path: allocate layer-first split K/V via the shared
+            # helper. FP8 DSA packs V into K, so v_width is 0 and v_buffer
+            # becomes a 5-D zero-element empty tensor.
+            native = self._native_buffers
+            base_dims = (self.layer_num, self.page_num, self.page_size, 1)
+            indexer_dims = (
+                len(native.index_layer_indices),
+                self.page_num,
+                self.page_size,
+                1,
+            )
+            return self._init_kv_split_buffer(
+                base_dims,
+                indexer_dims,
+            )
+        elif self.layout == "page_first_kv_split":
+            # Indexer buffers only exist for physical Indexer layers, which can
+            # be a subset of all layers (e.g. GLM 5.2: 21 of 78).  The device
+            # pool packs them as (num_indexer_layers, page, ...); the Host
+            # mirror uses (page, num_indexer_layers, ...).
+            native = self._native_buffers
+            base_dims = (self.page_num, self.layer_num, self.page_size, 1)
+            indexer_dims = (
+                self.page_num,
+                len(native.index_layer_indices),
+                self.page_size,
+                1,
+            )
+            return self._init_kv_split_buffer(
+                base_dims,
+                indexer_dims,
+            )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
@@ -393,56 +403,94 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         return buffer
 
-    def _kv_split_buffer_specs(self):
+    def _init_kv_split_buffer(self, base_dims, indexer_dims):
+        """Allocate split K/V (+ indexer) host buffers for NPU.
+
+        ``base_dims``/``indexer_dims`` carry the axis order, so both
+        ``page_first_kv_split`` (page-major) and ``layer_first_kv_split``
+        (layer-major) share this allocation tail. ``v_width == 0`` yields a 5-D
+        zero-element empty tensor because FP8 DSA packs V into K.
+        """
         native = self._native_buffers
-        # Indexer buffers only contain layers with physical Indexer storage.
         num_indexer_layers = len(native.index_layer_indices)
-        if self.layout == "layer_first_kv_split":
-            base_dims = (self.layer_num, self.page_num, self.page_size, 1)
-            indexer_dims = (num_indexer_layers, self.page_num, self.page_size, 1)
-        else:
-            base_dims = (self.page_num, self.layer_num, self.page_size, 1)
-            indexer_dims = (self.page_num, num_indexer_layers, self.page_size, 1)
+        alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
-        return (
-            ((*base_dims, k_width), self.dtype),
-            ((*base_dims, v_width), self.dtype),
-            ((*indexer_dims, native.index_width), self.dtype)
-            if native.index_k is not None
-            else None,
-            ((*indexer_dims, 1), torch.float32)
-            if native.index_scales is not None
-            else None,
+
+        backend = get_host_memory_backend()
+        if backend is not None:
+            # Declare the combined block budget up front. MemFabric fixes its
+            # entity reservation at the first declaration; the aclrt path
+            # registers each block at allocation time and keeps the no-op.
+            total_bytes = (
+                self.page_num
+                * self.page_size
+                * self.layer_num
+                * k_width
+                * self.dtype.itemsize
+            )
+            if v_width > 0:
+                total_bytes += (
+                    self.page_num
+                    * self.page_size
+                    * self.layer_num
+                    * v_width
+                    * self.dtype.itemsize
+                )
+            if native.index_k is not None:
+                total_bytes += (
+                    self.page_num
+                    * self.page_size
+                    * num_indexer_layers
+                    * native.index_width
+                    * self.dtype.itemsize
+                )
+            if native.index_scales is not None:
+                # FP32 scale mirror
+                total_bytes += self.page_num * self.page_size * num_indexer_layers * 4
+            backend.ensure_capacity(total_bytes, torch.npu.current_device())
+        self.k_buffer = alloc_func(
+            (*base_dims, k_width),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
         )
-
-    def host_buffer_specs(self):
-        return (spec for spec in self._kv_split_buffer_specs() if spec is not None)
-
-    def _init_kv_split_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
-
-        def allocate(spec):
-            if spec is None:
-                return None
-            dims, dtype = spec
-            if 0 in dims:
-                # FP8 DSA packs V into K. Keep the empty V tensor for the copy API.
-                return torch.empty(dims, dtype=dtype, device=self.device)
-            return alloc_func(
-                dims,
-                dtype=dtype,
+        if v_width == 0:
+            # FP8 DSA: V is packed into K, so the host v mirror holds no valid
+            # data. Keep a 5-D zero-element tensor (not None) so component
+            # builders can safely check ``numel() > 0`` without extra guards.
+            self.v_buffer = torch.empty(
+                (*base_dims, 0), dtype=self.dtype, device=self.device
+            )
+        else:
+            self.v_buffer = alloc_func(
+                (*base_dims, v_width),
+                dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-
-        (
-            self.k_buffer,
-            self.v_buffer,
-            self.index_k_buffer,
-            self.index_k_scale_buffer,
-        ) = map(allocate, self._kv_split_buffer_specs())
+        self.index_k_buffer = None
+        if native.index_k is not None:
+            self.index_k_buffer = alloc_func(
+                (*indexer_dims, native.index_width),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+        # Host-side mirror of the NPU quantized-Indexer FP32 scale cache.
+        self.index_k_scale_buffer = None
+        if native.index_scales is not None:
+            self.index_k_scale_buffer = alloc_func(
+                (*indexer_dims, 1),
+                dtype=torch.float32,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+        # Return k_buffer to preserve kv_buffer/data_refs init logic.
         return self.k_buffer
 
     def _init_write_back_staging_buffers(self):
