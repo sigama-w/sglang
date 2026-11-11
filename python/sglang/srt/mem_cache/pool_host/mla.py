@@ -34,10 +34,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
-from sglang.srt.mem_cache.pool_host.npu_host_memory import (
-    get_host_memory_backend,
-    reserve_npu_host_memory,
-)
+from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -415,54 +412,84 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         zero-element empty tensor because FP8 DSA packs V into K.
         """
         native = self._native_buffers
+        num_indexer_layers = len(native.index_layer_indices)
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
-        k_spec = ((*base_dims, k_width), self.dtype)
-        v_spec = ((*base_dims, v_width), self.dtype)
-        index_k_spec = (
-            ((*indexer_dims, native.index_width), self.dtype)
-            if native.index_k is not None
-            else None
-        )
-        index_scale_spec = (
-            ((*indexer_dims, 1), torch.float32)
-            if native.index_scales is not None
-            else None
-        )
 
         backend = get_host_memory_backend()
         if backend is not None:
-            reserve_npu_host_memory(
-                backend,
-                (
-                    spec
-                    for spec in (k_spec, v_spec, index_k_spec, index_scale_spec)
-                    if spec is not None
-                ),
+            # Declare the combined block budget up front. MemFabric fixes its
+            # entity reservation at the first declaration; the aclrt path
+            # registers each block at allocation time and keeps the no-op.
+            total_bytes = (
+                self.page_num
+                * self.page_size
+                * self.layer_num
+                * k_width
+                * self.dtype.itemsize
             )
-
-        def allocate(spec):
-            if spec is None:
-                return None
-            shape, dtype = spec
-            return alloc_func(
-                shape,
-                dtype=dtype,
+            if v_width > 0:
+                total_bytes += (
+                    self.page_num
+                    * self.page_size
+                    * self.layer_num
+                    * v_width
+                    * self.dtype.itemsize
+                )
+            if native.index_k is not None:
+                total_bytes += (
+                    self.page_num
+                    * self.page_size
+                    * num_indexer_layers
+                    * native.index_width
+                    * self.dtype.itemsize
+                )
+            if native.index_scales is not None:
+                # FP32 scale mirror
+                total_bytes += self.page_num * self.page_size * num_indexer_layers * 4
+            backend.ensure_capacity(total_bytes, torch.npu.current_device())
+        self.k_buffer = alloc_func(
+            (*base_dims, k_width),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        if v_width == 0:
+            # FP8 DSA: V is packed into K, so the host v mirror holds no valid
+            # data. Keep a 5-D zero-element tensor (not None) so component
+            # builders can safely check ``numel() > 0`` without extra guards.
+            self.v_buffer = torch.empty(
+                (*base_dims, 0), dtype=self.dtype, device=self.device
+            )
+        else:
+            self.v_buffer = alloc_func(
+                (*base_dims, v_width),
+                dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-
-        self.k_buffer = allocate(k_spec)
-        if v_width == 0:
-            # FP8 DSA packs V into K. Keep a 5-D empty tensor for the copy API.
-            shape, dtype = v_spec
-            self.v_buffer = torch.empty(shape, dtype=dtype, device=self.device)
-        else:
-            self.v_buffer = allocate(v_spec)
-        self.index_k_buffer = allocate(index_k_spec)
-        self.index_k_scale_buffer = allocate(index_scale_spec)
+        self.index_k_buffer = None
+        if native.index_k is not None:
+            self.index_k_buffer = alloc_func(
+                (*indexer_dims, native.index_width),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+        # Host-side mirror of the NPU quantized-Indexer FP32 scale cache.
+        self.index_k_scale_buffer = None
+        if native.index_scales is not None:
+            self.index_k_scale_buffer = alloc_func(
+                (*indexer_dims, 1),
+                dtype=torch.float32,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
         # Return k_buffer to preserve kv_buffer/data_refs init logic.
         return self.k_buffer
 

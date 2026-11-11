@@ -35,7 +35,6 @@ from sglang.srt.mem_cache.pool_host.mha import (
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
     get_host_memory_backend,
-    reserve_npu_host_memory,
 )
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -958,23 +957,24 @@ def _reserve_dsv4_paged_host_memory(
 
     import torch
 
-    # Describe all DSV4 paged host blocks before constructing the SWA pool.
-    buffer_specs = []
+    # Declare every DSV4 paged host block before constructing the SWA pool.
+    # Per-block byte sizes; MemFabric fixes its reservation at the first
+    # declaration, so the blocks are summed before declaring.
+    paged_blocks = []
     layer_first = get_memory().hicache_mem_layout == "layer_first"
 
-    def add_blocks(pages, layer_page_bytes):
-        if not layer_page_bytes:
+    def add_blocks(layer_bytes):
+        if not layer_bytes:
             return
+        # Match actual allocator calls: one block per layer for layer_first,
+        # one block for the entire pool for page-first layouts.
         if layer_first:
-            buffer_specs.extend(
-                ((pages, page_bytes), torch.uint8) for page_bytes in layer_page_bytes
-            )
+            paged_blocks.extend(layer_bytes)
         else:
-            # A page-first row contains the payloads for all layers.
-            buffer_specs.append(((pages, sum(layer_page_bytes)), torch.uint8))
+            paged_blocks.append(sum(layer_bytes))
 
     def add_paged(buffers, item_bytes, pages):
-        add_blocks(pages, [item_bytes] * len(buffers))
+        add_blocks([pages * item_bytes] * len(buffers))
 
     if has_paged_swa:
         add_paged(
@@ -995,13 +995,15 @@ def _reserve_dsv4_paged_host_memory(
                 kvcache.compress_state_pools,
                 kvcache.indexer_compress_state_pools,
             ):
-                state_page_bytes = []
+                state_blocks = []
                 for layer_id in c4_state_global_layers:
                     pool = state_pools[layer_id]
-                    state_page_bytes.append(
-                        pool.ring_size * pool.kv_score_buffer.kv_score[0].nbytes
+                    state_blocks.append(
+                        swa_num_host_pages
+                        * pool.ring_size
+                        * pool.kv_score_buffer.kv_score[0].nbytes
                     )
-                add_blocks(swa_num_host_pages, state_page_bytes)
+                add_blocks(state_blocks)
     if c128_layer_mapping:
         buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 128)
         add_paged(buffers, item_bytes, c128_num_host_pages)
@@ -1009,8 +1011,8 @@ def _reserve_dsv4_paged_host_memory(
         if sibling is not None:
             add_paged(sibling[1], sibling[2], c128_num_host_pages)
     backend = get_host_memory_backend()
-    if buffer_specs and backend is not None:
-        reserve_npu_host_memory(backend, buffer_specs)
+    if paged_blocks and backend is not None:
+        backend.ensure_capacity(sum(paged_blocks), torch.npu.current_device())
 
 
 def build_deepseek_v4_hicache_stack(

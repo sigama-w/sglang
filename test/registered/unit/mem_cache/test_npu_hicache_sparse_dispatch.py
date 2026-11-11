@@ -1,9 +1,6 @@
 """Exercise real MLA PF/LF routing and layer ownership without an NPU runtime."""
 
-from __future__ import annotations
-
 import ast
-import math
 import os
 import sys
 import unittest
@@ -127,15 +124,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ],
             type_ignores=[],
         )
-        backend_tree = ast.parse(path.with_name("npu_host_memory.py").read_text())
-        methods.body.append(
-            next(
-                n
-                for n in backend_tree.body
-                if isinstance(n, ast.FunctionDef)
-                and n.name == "reserve_npu_host_memory"
-            )
-        )
         self.ops = {
             name: Mock(name=name)
             for name in (
@@ -149,7 +137,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.namespace = dict(
             self.ops,
             _is_npu=True,
-            math=math,
             maybe_dcp_kernel_indices=self.localize,
             logger=Mock(),
             torch=SimpleNamespace(
@@ -416,7 +403,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ALLOC_MEMORY_FUNCS={"npu": allocate},
             get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
             torch=SimpleNamespace(
-                float32=SimpleNamespace(itemsize=4),
+                float32="fp32",
                 empty=empty,
                 npu=SimpleNamespace(current_device=lambda: 0),
             ),
@@ -466,7 +453,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ALLOC_MEMORY_FUNCS={"npu": allocate},
             get_host_memory_backend=lambda: SimpleNamespace(ensure_capacity=reserve),
             torch=SimpleNamespace(
-                float32=SimpleNamespace(itemsize=4),
+                float32="fp32",
                 empty=empty,
                 npu=SimpleNamespace(current_device=lambda: 0),
             ),
