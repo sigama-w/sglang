@@ -62,11 +62,23 @@ def acl_host_memory_enabled() -> bool:
 
 @lru_cache(maxsize=1)
 def _log_acl_mmap_host_pool() -> None:
-    logger.info(
-        "SGLANG_HICACHE_HOST_MEM_BACKEND=acl: host blocks come from the "
-        "mmap allocator (SGLANG_HUGEPAGE_SIZE=%r).",
-        envs.SGLANG_HUGEPAGE_SIZE.get() or "",
-    )
+    configured = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    if configured in ("2MB", "1GB"):
+        logger.info(
+            "SGLANG_HICACHE_HOST_MEM_BACKEND=acl: host blocks come from the "
+            "mmap allocator; SGLANG_HUGEPAGE_SIZE=%s -> trying %s hugetlb "
+            "pages, per-block fallback to prefaulted 4KB plain mmap on "
+            "allocation failure.",
+            configured,
+            configured,
+        )
+    else:
+        logger.info(
+            "SGLANG_HICACHE_HOST_MEM_BACKEND=acl: host blocks come from the "
+            "mmap allocator; SGLANG_HUGEPAGE_SIZE=%r (unset or unrecognized) "
+            "-> prefaulted 4KB plain pages, no hugepage attempt.",
+            configured,
+        )
 
 
 def ascendc_io_enabled() -> bool:
