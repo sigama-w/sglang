@@ -186,7 +186,7 @@ class MemfabricHostMemoryBackend(NpuHostMemoryBackend):
             # LOCAL scene requires alloc_size == reserve_size.
             config.alloc_size = total_bytes
             config.scene = offload.Scene.LOCAL
-            config.flags = 0
+            config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
             ret = self._pool.initialize(config)
             if ret != 0:
                 self._pool = None
