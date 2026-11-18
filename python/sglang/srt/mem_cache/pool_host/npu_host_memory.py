@@ -359,6 +359,30 @@ def reserve_mla_split_host_memory(
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
+def reserve_mamba_host_memory(
+    *,
+    size: int,
+    size_per_token: int,
+) -> None:
+    """Reserve the Mamba host pool before allocating its buffers.
+
+    The pool budget (size * size_per_token bytes, conv plus temporal plus
+    side states) must be declared before the host buffers allocate because
+    MemFabric fixes its reservation at the first declaration.
+    """
+    backend = get_host_memory_backend()
+    if backend is None:
+        return
+
+    total_bytes = size * size_per_token
+    backend.ensure_capacity(total_bytes, torch.npu.current_device())
+    logger.info(
+        "[HiCache] %s backend reserved %.2f GB for the mamba host pool",
+        host_memory_backend(),
+        total_bytes / 1e9,
+    )
+
+
 def reserve_dsv4_paged_host_memory(
     *,
     infos: Mapping[PoolName, DevicePoolInfo],
