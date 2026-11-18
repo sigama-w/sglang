@@ -89,6 +89,58 @@ def _mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Ten
     return logits if logits.dtype == hidden.dtype else logits.to(hidden.dtype)
 
 
+def _npu_mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """logits = hidden @ weight.T via the Ascend MXFP8 quantized GEMM.
+
+    Both 'fp8' and 'mxfp8' route here: Ascend's fp8 matmul is block-scaled
+    (e4m3 payload + UE8M0 1x32-group scales), so the two CLI choices share
+    one kernel. Mirrors NPUMXFP8LinearMethod.apply.
+    """
+    from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
+        _get_float8_e8m0fnu_dtype,
+    )
+
+    weight = lm_head.weight  # [N(vocab_slice), K(hidden)]
+    cache = getattr(lm_head, "_npu_mxfp8_weight_cache", None)
+    if cache is None or cache[0].shape != weight.shape:
+        w_q, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            weight.to(torch.bfloat16), dst_type=torch.float8_e4m3fn
+        )
+        if w_scale.dim() == 2:
+            # Older torch_npu builds return [N, K//32]; reshape to 3D.
+            w_scale = w_scale.reshape(w_scale.shape[0], w_scale.shape[1] // 2, 2)
+        # Transposed views for npu_quant_matmul's [K, N] weight layout — DO NOT
+        # call .contiguous(): the kernel scans the row-major source K-major and
+        # a physical reorder tanks HBM bandwidth (see linear_method_npu.py).
+        cache = (w_q.transpose(0, 1), w_scale.transpose(0, 1))
+        lm_head._npu_mxfp8_weight_cache = cache
+    w_kn, w_sf_kn = cache
+
+    orig_shape = hidden.shape
+    x_2d = hidden.reshape(-1, orig_shape[-1])
+    if x_2d.dtype not in (torch.float16, torch.bfloat16):
+        x_2d = x_2d.to(torch.bfloat16)
+    qx, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        x_2d, dst_type=torch.float8_e4m3fn
+    )
+    if x_scale.dim() == 2:
+        x_scale = x_scale.reshape(x_scale.shape[0], x_scale.shape[1] // 2, 2)
+
+    e8m0 = _get_float8_e8m0fnu_dtype()
+    logits = torch.ops.npu.npu_quant_matmul(
+        qx,
+        w_kn,
+        w_sf_kn,
+        scale_dtype=e8m0,
+        pertoken_scale=x_scale,
+        pertoken_scale_dtype=e8m0,
+        output_dtype=x_2d.dtype,
+        group_sizes=[1, 1, 32],
+    )
+    logits = logits.reshape(*orig_shape[:-1], -1)
+    return logits if logits.dtype == hidden.dtype else logits.to(hidden.dtype)
+
+
 def _is_pow2(n: int) -> bool:
     return n > 0 and n & (n - 1) == 0
 
@@ -130,6 +182,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     weight = lm_head.weight
     dtype = get_spec().speculative_dspark_lm_head_dtype
     if dtype is not None and weight.is_floating_point() and hidden.shape[0] > 0:
+        # NPU: both dtype choices run the shared Ascend MXFP8 kernel; it
+        # requires K (hidden) divisible by 2 * 32-group size.
+        if hidden.is_npu and weight.shape[-1] % 64 == 0:
+            return _npu_mxfp8_lm_head_matmul(hidden, lm_head)
         if dtype == "fp8" and weight.shape[-1] % 16 == 0:
             return _fp8_lm_head_matmul(hidden, lm_head)
         if (

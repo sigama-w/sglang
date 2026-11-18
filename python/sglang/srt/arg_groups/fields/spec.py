@@ -169,8 +169,9 @@ class Spec(msgspec.Struct):
             "target lm_head; the weight is quantized once and cached (about one extra "
             "byte per lm_head parameter). 'fp8' runs torch._scaled_mm and requires "
             "gfx95x; 'mxfp8' runs FlashInfer's CuTe DSL mm_mxfp8 and requires "
-            "Blackwell. Target verify logits are unaffected. Default keeps the "
-            "lm_head's own dtype.",
+            "Blackwell. On Ascend NPU both values run the native MXFP8 "
+            "npu_quant_matmul. Target verify logits are unaffected. Default keeps "
+            "the lm_head's own dtype.",
             choices=["fp8", "mxfp8"],
             resolvable=True,
         ),
