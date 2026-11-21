@@ -76,7 +76,8 @@ _MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_DEBUG_MAMBA_CKPT", "0") == "1"
 
 def _ckpt_debug(fmt: str, *args) -> None:
     if _MAMBA_CKPT_DEBUG:
-        logger.info("[mamba-ckpt] " + fmt, *args)
+        # WARNING so it survives any per-logger level filtering.
+        logger.warning("[mamba-ckpt] " + fmt, *args)
 
 
 def branching_checkpoint_depth(

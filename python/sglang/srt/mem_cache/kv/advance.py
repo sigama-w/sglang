@@ -44,7 +44,7 @@ def advance_tracking(storage, req, update: TrackingAdvance) -> None:
         kv.mamba_prev_track_seqlen = kv.mamba_last_track_seqlen
     if update.boundary is not msgspec.UNSET:
         if _MAMBA_CKPT_DEBUG and update.boundary != kv.mamba_last_track_seqlen:
-            logger.info(
+            logger.warning(
                 "[mamba-ckpt] advance: req=%s boundary %s -> %s "
                 "(last_pos=%s next_pos=%s preserve_prev=%s)",
                 getattr(req, "rid", "?"),
