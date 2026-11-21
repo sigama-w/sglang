@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_DEBUG_MAMBA_CKPT", "0") == "1"
+# TEMP DEBUG: hardcoded on to rule out env propagation issues. Revert to
+# os.environ.get("SGLANG_DEBUG_MAMBA_CKPT", "0") == "1" after debugging.
+_MAMBA_CKPT_DEBUG = True
 
 
 class TrackingAdvance(msgspec.Struct, frozen=True, kw_only=True):

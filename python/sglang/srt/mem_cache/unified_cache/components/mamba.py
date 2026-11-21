@@ -71,13 +71,21 @@ logger = logging.getLogger(__name__)
 
 # Set SGLANG_DEBUG_MAMBA_CKPT=1 to trace mamba checkpoint write/match
 # decisions (boundary advances, finished-request donations, prefix matches).
-_MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_DEBUG_MAMBA_CKPT", "0") == "1"
+# TEMP DEBUG: hardcoded on to rule out env propagation issues. Revert to
+# os.environ.get("SGLANG_DEBUG_MAMBA_CKPT", "0") == "1" after debugging.
+_MAMBA_CKPT_DEBUG = True
 
 
 def _ckpt_debug(fmt: str, *args) -> None:
     if _MAMBA_CKPT_DEBUG:
         # WARNING so it survives any per-logger level filtering.
         logger.warning("[mamba-ckpt] " + fmt, *args)
+
+
+# Import-time canary: proves this instrumented file is actually the one the
+# scheduler process loaded. Unconditional (no env var, no logging config).
+print("[mamba-ckpt] instrumentation loaded", flush=True)
+logger.warning("[mamba-ckpt] instrumentation loaded")
 
 
 def branching_checkpoint_depth(
