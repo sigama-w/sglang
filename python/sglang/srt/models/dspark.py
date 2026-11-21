@@ -173,11 +173,34 @@ def gather_and_crop_vocab(
     return full_logits[..., : int(lm_head.org_vocab_size)]
 
 
+_lm_head_path_logged = False
+
+
+def _log_lm_head_path_once(path: str, dtype, weight: torch.Tensor, hidden: torch.Tensor) -> None:
+    """One-shot log of which draft lm_head projection path is actually taken,
+    so a silently-falling-back flag is visible without spamming the hot path."""
+    global _lm_head_path_logged
+    if _lm_head_path_logged:
+        return
+    _lm_head_path_logged = True
+    logger.info(
+        "[dspark lm_head] path=%s, flag=%s, weight.dtype=%s, weight.shape=%s, "
+        "is_npu=%s, k_mod_64=%d",
+        path,
+        dtype,
+        weight.dtype,
+        tuple(weight.shape),
+        hidden.is_npu,
+        weight.shape[-1] % 64,
+    )
+
+
 def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
     """Project draft hidden states through the target head; a quantized head
     stores `weight` packed, so it needs its own kernel instead of a matmul."""
     quant_method = lm_head.quant_method
     if should_apply_lm_head_quant_method(lm_head, quant_method):
+        _log_lm_head_path_once("quant_method_apply", None, lm_head.weight, hidden)
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
     dtype = get_spec().speculative_dspark_lm_head_dtype
@@ -185,8 +208,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
         # NPU: both dtype choices run the shared Ascend MXFP8 kernel; it
         # requires K (hidden) divisible by 2 * 32-group size.
         if hidden.is_npu and weight.shape[-1] % 64 == 0:
+            _log_lm_head_path_once("npu_mxfp8_quant_matmul", dtype, weight, hidden)
             return _npu_mxfp8_lm_head_matmul(hidden, lm_head)
         if dtype == "fp8" and weight.shape[-1] % 16 == 0:
+            _log_lm_head_path_once("cuda_scaled_mm_fp8", dtype, weight, hidden)
             return _fp8_lm_head_matmul(hidden, lm_head)
         if (
             dtype == "mxfp8"
@@ -194,7 +219,9 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
             and weight.shape[-1] % 32 == 0
             and weight.shape[0] % 128 == 0
         ):
+            _log_lm_head_path_once("cuda_cutedsl_mxfp8", dtype, weight, hidden)
             return _mxfp8_lm_head_matmul(hidden, lm_head)
+    _log_lm_head_path_once("plain_matmul", dtype, weight, hidden)
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
