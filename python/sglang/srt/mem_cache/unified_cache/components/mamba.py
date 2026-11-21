@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import heapq
+import logging
 import math
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -63,6 +65,18 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+logger = logging.getLogger(__name__)
+
+# Set SGLANG_DEBUG_MAMBA_CKPT=1 to trace mamba checkpoint write/match
+# decisions (boundary advances, finished-request donations, prefix matches).
+_MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_DEBUG_MAMBA_CKPT", "0") == "1"
+
+
+def _ckpt_debug(fmt: str, *args) -> None:
+    if _MAMBA_CKPT_DEBUG:
+        logger.info("[mamba-ckpt] " + fmt, *args)
 
 
 def branching_checkpoint_depth(
@@ -215,6 +229,13 @@ class MambaComponent(TreeComponent):
         # write-back eviction may discard the device-only state.
         branching_seqlen = branching_checkpoint_depth(
             result.full_kv_hit_length, mamba_boundary_len, self.mamba_checkpoint_grid
+        )
+        _ckpt_debug(
+            "match: full_kv_hit=%d boundary=%d grid=%d branching=%s",
+            result.full_kv_hit_length,
+            mamba_boundary_len,
+            self.mamba_checkpoint_grid,
+            branching_seqlen,
         )
 
         # HiCache: if mamba was evicted from device but has host backup,
@@ -943,8 +964,17 @@ class MambaComponent(TreeComponent):
         pool = self.cache.req_to_token_pool
         keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
         cache_len = req.kv.mamba_last_track_seqlen or 0
+        _ckpt_debug(
+            "select_finished: token_ids_len=%d last_track=%s prev_track=%s "
+            "track_buf_size=%d",
+            token_ids_len,
+            req.kv.mamba_last_track_seqlen,
+            req.kv.mamba_prev_track_seqlen,
+            pool.mamba_ping_pong_track_buffer_size,
+        )
 
         if cache_len <= token_ids_len:
+            _ckpt_debug("select_finished: donate keep slot at %d", cache_len)
             return cache_len, keep_idx
 
         # Overshoot: the latest state ran past the key. The other slot always
@@ -955,7 +985,14 @@ class MambaComponent(TreeComponent):
             or previous_cache_len is None
             or previous_cache_len > token_ids_len
         ):
+            _ckpt_debug(
+                "select_finished: overshoot unusable (cache_len=%d), donate nothing",
+                cache_len,
+            )
             return None
+        _ckpt_debug(
+            "select_finished: overshoot, donate other slot at %d", previous_cache_len
+        )
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
     def _defers_checkpoint(
@@ -998,6 +1035,13 @@ class MambaComponent(TreeComponent):
                 storage, sub_pool = self._state()
                 cache_len -= storage.settle_replay(sub_pool, req.kv.mamba_pool_idx)
 
+        _ckpt_debug(
+            "prepare_caching: token_ids_len=%d is_finished=%s cache_len=%s level=%d",
+            token_ids_len,
+            is_finished,
+            cache_len,
+            self.checkpoints_level,
+        )
         if is_finished:
             if cache_len is None:
                 cache_len = 0

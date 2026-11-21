@@ -3,6 +3,8 @@ past the rows a window no longer reads."""
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import msgspec
@@ -13,6 +15,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+logger = logging.getLogger(__name__)
+
+_MAMBA_CKPT_DEBUG = os.environ.get("SGLANG_DEBUG_MAMBA_CKPT", "0") == "1"
 
 
 class TrackingAdvance(msgspec.Struct, frozen=True, kw_only=True):
@@ -37,6 +43,17 @@ def advance_tracking(storage, req, update: TrackingAdvance) -> None:
     if update.preserve_previous:
         kv.mamba_prev_track_seqlen = kv.mamba_last_track_seqlen
     if update.boundary is not msgspec.UNSET:
+        if _MAMBA_CKPT_DEBUG and update.boundary != kv.mamba_last_track_seqlen:
+            logger.info(
+                "[mamba-ckpt] advance: req=%s boundary %s -> %s "
+                "(last_pos=%s next_pos=%s preserve_prev=%s)",
+                getattr(req, "rid", "?"),
+                kv.mamba_last_track_seqlen,
+                update.boundary,
+                update.last_position,
+                update.next_position,
+                update.preserve_previous,
+            )
         kv.mamba_last_track_seqlen = update.boundary
     if update.last_position is not None:
         kv.mamba_last_track_idx = update.last_position
